@@ -160,7 +160,7 @@ lazy_static! {
 
         map.insert("get_file", ToolMetadata {
             name: "get_file",
-            description: "File contents, optionally one contiguous start_line..end_line range. For context around scattered line numbers use get_excerpt.",
+            description: "File contents, optionally one contiguous start_line..end_line range. For context around scattered line numbers use get_excerpt. Pass revision (branch, tag or commit) to read the file as of that revision; requires --git.",
             category: ToolCategory::Repository,
             tags: ["file", "read", "content"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -172,7 +172,8 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "path": {"type": "string", "description": "File path relative to repository root"},
                     "start_line": {"type": "integer", "description": "Start line (1-indexed, optional)"},
-                    "end_line": {"type": "integer", "description": "End line (inclusive, optional)"}
+                    "end_line": {"type": "integer", "description": "End line (inclusive, optional)"},
+                    "revision": {"type": "string", "description": "Branch, tag or commit to read the file at (default: working tree; requires --git)"}
                 },
                 "required": ["repo", "path"]
             }),

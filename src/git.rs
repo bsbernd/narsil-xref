@@ -622,6 +622,27 @@ impl GitRepo {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    /// Get the content of a file as of a specific ref (branch, tag, or commit)
+    pub fn show_file_at_ref(&self, rev: &str, file_path: &str) -> Result<String> {
+        Self::validate_input(rev, "ref")?;
+        Self::validate_input(file_path, "file_path")?;
+        let (work_tree, file_path) = self.work_tree_for(file_path);
+
+        let object = format!("{}:{}", rev, file_path);
+        let output = Command::new("git")
+            .args(["show", &object])
+            .current_dir(&work_tree)
+            .output()
+            .context("Failed to run git show")?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("git show {} failed: {}", object, err));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
     /// The ref StGit keeps for patch `name` on the current branch, if it exists.
     fn stgit_patch_ref(&self, name: &str) -> Option<String> {
         let branch = self.current_branch().ok()?;
