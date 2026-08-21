@@ -4420,11 +4420,25 @@ impl CodeIntelEngine {
         path: &str,
         start_line: Option<usize>,
         end_line: Option<usize>,
+        revision: Option<&str>,
     ) -> Result<String> {
-        let repo_path = PathBuf::from(self.resolve_repo(repo)?);
-        let file_path = validate_path(&repo_path, path)?;
+        let repo_key = self.resolve_repo(repo)?;
+        let repo_path = PathBuf::from(&repo_key);
 
-        let content = std::fs::read_to_string(&file_path).context("Failed to read file")?;
+        let content = if let Some(rev) = revision {
+            // The path only needs to exist at `rev`; git reports it when it does not.
+            validate_pathspec(path)?;
+            let git_repo = self.git_repos.get(&repo_key).ok_or_else(|| {
+                anyhow!(
+                    "Git not available for {}. Enable with --git flag.",
+                    repo_key
+                )
+            })?;
+            git_repo.show_file_at_ref(rev, path)?
+        } else {
+            let file_path = validate_path(&repo_path, path)?;
+            std::fs::read_to_string(&file_path).context("Failed to read file")?
+        };
 
         let lines: Vec<&str> = content.lines().collect();
         let start = start_line.unwrap_or(1).saturating_sub(1);
@@ -4471,6 +4485,9 @@ impl CodeIntelEngine {
 
         let mut output = String::new();
         output.push_str(&format!("# {}\n\n", path));
+        if let Some(rev) = revision {
+            output.push_str(&format!("**Revision**: `{}`\n\n", rev));
+        }
         output.push_str(&format!(
             "Lines {}-{} of {}\n\n",
             start + 1,
@@ -10837,7 +10854,7 @@ similarity index 90%
             .await
             .unwrap();
         let out = engine
-            .get_file(repo.to_str().unwrap(), "big.c", Some(1), Some(5000))
+            .get_file(repo.to_str().unwrap(), "big.c", Some(1), Some(5000), None)
             .await
             .unwrap();
 
@@ -10877,7 +10894,7 @@ similarity index 90%
         let repo = repo.to_str().unwrap();
 
         let past_eof = engine
-            .get_file(repo, "short.c", Some(99000), Some(99010))
+            .get_file(repo, "short.c", Some(99000), Some(99010), None)
             .await
             .unwrap_err()
             .to_string();
@@ -10887,7 +10904,7 @@ similarity index 90%
         );
 
         let reversed = engine
-            .get_file(repo, "short.c", Some(3), Some(1))
+            .get_file(repo, "short.c", Some(3), Some(1), None)
             .await
             .unwrap_err()
             .to_string();
@@ -10898,7 +10915,7 @@ similarity index 90%
 
         // The bounds a short file does satisfy still answer.
         let clamped = engine
-            .get_file(repo, "short.c", Some(2), Some(99))
+            .get_file(repo, "short.c", Some(2), Some(99), None)
             .await
             .unwrap();
         assert!(clamped.contains("Lines 2-3 of 3"), "{clamped}");

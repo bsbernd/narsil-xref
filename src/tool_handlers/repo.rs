@@ -57,7 +57,10 @@ impl ToolHandler for GetFileHandler {
         let path = super::require_arg(&args, "path", "get_file")?;
         let start_line = args.get_u64("start_line").map(|v| v as usize);
         let end_line = args.get_u64("end_line").map(|v| v as usize);
-        engine.get_file(repo, path, start_line, end_line).await
+        let revision = args.get_str("revision");
+        engine
+            .get_file(repo, path, start_line, end_line, revision)
+            .await
     }
 }
 
@@ -98,7 +101,9 @@ impl ToolHandler for GetExcerptHandler {
             // unambiguously which lines the caller wants — read them rather
             // than erroring and making the caller re-issue the same request
             // against the other tool.
-            return engine.get_file(repo, path, start_line, end_line).await;
+            return engine
+                .get_file(repo, path, start_line, end_line, None)
+                .await;
         }
         if lines.is_empty() {
             // Neither argument shape: without this the empty `lines` reads as
