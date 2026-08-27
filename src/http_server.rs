@@ -220,6 +220,7 @@ impl HttpServer {
         // Frontend / dashboard routes.
         let frontend = Router::new()
             .route("/health", get(health_check))
+            .route("/ready", get(readiness_check))
             .route("/tools", get(list_tools))
             .route("/tools/call", post(call_tool))
             .route("/graph", get(get_graph))
@@ -518,12 +519,37 @@ fn is_loopback_host(host: &str) -> bool {
     matches!(hostname, "localhost" | "127.0.0.1" | "::1")
 }
 
-/// Health check endpoint
+/// Liveness probe: the process is up and serving HTTP.
+///
+/// Deliberately says nothing about the index. Use `/ready` to find out whether
+/// the answers can be trusted.
 async fn health_check() -> impl IntoResponse {
     Json(json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+/// Readiness probe: 503 until complete_initialization() has indexed every
+/// configured repository. Before that, tools answer from the persisted index.
+async fn readiness_check(State(state): State<AppState>) -> impl IntoResponse {
+    let ready = state.engine.is_fully_initialized();
+    let status = state.engine.get_initialization_status();
+
+    let code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        code,
+        Json(json!({
+            "status": if ready { "ready" } else { "initializing" },
+            "version": env!("CARGO_PKG_VERSION"),
+            "initialization": status,
+        })),
+    )
 }
 
 /// List available tools
@@ -951,5 +977,37 @@ mod tests {
         assert!(!is_loopback_host("127.0.0.2"));
         // Malformed IPv6 bracket — bail out.
         assert!(!is_loopback_host("[::1"));
+    }
+
+    #[tokio::test]
+    async fn readiness_check_is_503_until_initialization_completes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("widget.rs"), "pub fn widget_fn() {}\n").unwrap();
+        let engine = Arc::new(
+            CodeIntelEngine::with_options(
+                tmp.path().join("index"),
+                vec![repo],
+                crate::index::EngineOptions::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        let state = AppState {
+            engine: Arc::clone(&engine),
+            tool_registry: Arc::new(ToolRegistry::new()),
+            mcp_server: None,
+            sessions: Arc::new(DashMap::new()),
+            streamable_sessions: Arc::new(DashMap::new()),
+            sse_keepalive: DEFAULT_SSE_KEEPALIVE,
+        };
+
+        let response = readiness_check(State(state.clone())).await.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        engine.complete_initialization().await.unwrap();
+        let response = readiness_check(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
