@@ -1421,13 +1421,48 @@ fn format_duration_seconds(seconds: u64) -> String {
 }
 
 fn format_unix_timestamp(seconds: u64) -> String {
-    use chrono::DateTime;
-    DateTime::from_timestamp(seconds as i64, 0)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| format!("{}", seconds))
+    let (date, time) = utc_date_and_time(seconds);
+    format!("{date} {time} UTC")
 }
 
-fn now_unix_seconds() -> u64 {
+/// The UTC date ("2024-02-29") and time of day ("23:59:59") of a Unix time,
+/// for callers that print a timestamp without a date-time crate.
+///
+/// The date comes from Howard Hinnant's days-to-civil algorithm, which counts
+/// in 400-year eras of 146097 days, with years starting on March 1 so that
+/// the leap day is the last day of a year.
+pub(crate) fn utc_date_and_time(seconds: u64) -> (String, String) {
+    let days_since_epoch = seconds / 86400;
+    let second_of_day = seconds % 86400;
+
+    // 719468 days lie between 0000-03-01 and 1970-01-01.
+    let days = days_since_epoch + 719468;
+    let era = days / 146097;
+    let day_of_era = days % 146097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    // Month 0 is March, month 11 is February.
+    let month_from_march = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_from_march + 2) / 5 + 1;
+    let (month, year_shift) = if month_from_march < 10 {
+        (month_from_march + 3, 0)
+    } else {
+        (month_from_march - 9, 1)
+    };
+    let year = era * 400 + year_of_era + year_shift;
+
+    let date = format!("{year:04}-{month:02}-{day:02}");
+    let time = format!(
+        "{:02}:{:02}:{:02}",
+        second_of_day / 3600,
+        second_of_day % 3600 / 60,
+        second_of_day % 60
+    );
+    (date, time)
+}
+
+pub(crate) fn now_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1831,6 +1866,24 @@ mod tests {
     use super::*;
     use std::thread;
     use tempfile::TempDir;
+
+    #[test]
+    fn utc_date_and_time_handles_leap_days_and_centuries() {
+        // Expected values from `date -u -d @<seconds>`.
+        let cases = [
+            (0, "1970-01-01", "00:00:00"),
+            (951782400, "2000-02-29", "00:00:00"),
+            (1709251199, "2024-02-29", "23:59:59"),
+            (4107542400, "2100-03-01", "00:00:00"),
+        ];
+        for (seconds, date, time) in cases {
+            assert_eq!(
+                utc_date_and_time(seconds),
+                (date.to_string(), time.to_string()),
+                "{seconds}"
+            );
+        }
+    }
 
     // Override the global stats dir for tests so we don't touch the real
     // ~/.cache/narsil-xref. We do this by giving each test a temp directory
