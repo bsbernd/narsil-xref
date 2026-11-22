@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repositories, the WASM build, the lint tools (dead code, dead stores,
   uninitialized variables, type inference and checking), the import-graph
   tools and the chunk/similarity retrieval tools are gone, with the crates
-  and cargo features that served them. 42 tools remain.
+  and cargo features that served them. 43 tools remain.
 - **Tool presets and editor detection.** Tool selection is `--expose` /
   `expose:` groups (`base`, `code`, `git`, `analysis`) intersected with the
   engine's feature flags and per-tool `overrides:`. `NARSIL_PRESET`,
@@ -56,52 +56,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes its cache under the user cache directory instead of a `.ccls-cache/` in
   the repo. The earlier per-repo `lsp:` / `background_index:` keys are replaced
   by these blocks and rejected at startup.
-- **Symbolic heap-overflow detection (CWE-122-001)**. A new `heap_size`
-  subsystem builds a `SizeExpr` algebra for allocator calls
-  (`malloc`/`calloc`/`realloc`/`asprintf`/`vasprintf`/`strdup`/`strndup`)
-  and string-writing calls (`sprintf`/`vsprintf`/`strcpy`/`strncpy`/
-  `strcat`/`memcpy`/`memmove`/`memset`) and emits a Critical-severity
-  CWE-122-001 finding when the write provably exceeds the allocation.
-  Detection is symbolic: `Constant(40)` vs `Constant(32)` fires,
-  `StrlenOf(name) + 2` vs `StrlenOf(name) + 1` fires, and
-  `Unknown`-tainted expressions short-circuit to "no finding" so the
-  rule never invents false positives. A function-summary cache
-  resolves one-hop helper allocations like `char *buf = helper(arg);`
-  by substituting the caller's argument expressions for the callee's
-  parameter names. The cache is translation-unit-local by default;
-  when the analyser is invoked through `scan_security` /
-  `security_audit` it is augmented by a `CallGraphContext` that
-  follows the project call graph across translation-unit boundaries,
-  so an allocator helper in one `.c` file paired with an over-sized
-  write in another is detected. Disambiguation for `static`-symbol
-  collisions: prefer the definition in the caller's own file;
-  otherwise accept a unique external definition; otherwise
-  short-circuit to `Unknown` rather than guess.
-- **`scan_security` now folds taint flows into its output**. Every
-  unsanitised flow from the taint analyser surfaces as a `TAINT-*`
-  `SecurityFinding` anchored at the sink, carrying the
-  vulnerability's CWE, OWASP category, severity, and confidence
-  verbatim. Callers no longer need to chain `get_taint_sources` +
-  `trace_taint` to see source-to-sink coverage.
-- **New `security_audit` MCP tool**. A single aggregator that runs
-  every security pass the engine supports (pattern rules, symbolic
-  CWE-122 detection, taint flows) and returns one ranked report
-  prefixed with a summary panel. Use this instead of chaining
-  `scan_security` + `check_owasp_top10` + `check_cwe_top25` by hand.
-  The accompanying `/security-audit` skill documents when to reach
-  for the aggregator vs. the individual tools.
-- **Partial CWE-680 (integer-overflow-to-buffer) detection**. Two
-  new rules cover the most common shapes: **CWE-680-001** fires on
-  literal-constant arithmetic in allocator size arguments that
-  provably wraps u64 (`calloc(0xFFFFFFFFFFFFFFFF, 2)`,
-  `malloc(0xFFFFFFFFFFFFFFFF + 1)`, etc.); **CWE-680-002** fires on
-  the structural exploit shape `malloc(n * sizeof(T))` /
-  `calloc(n, sizeof(T))` where `n` is not a compile-time constant.
-  Both rules are **PARTIAL** by design — they have no value-range
-  analysis, no taint, and no inter-procedural reasoning. The
-  caveat is carried verbatim in every emitted finding's `message`
-  field so AI callers reading the output understand a clean scan
-  does not prove the file free of CWE-680 bugs.
+- **C and C++ backends checked against each other.** Symbols, references
+  and call graphs from tree-sitter, clangd, ccls and gtags are compared, so
+  a reference one backend misses can come from another.
+- **One SSE server per config profile.** A stdio session that the editor
+  starts forwards its requests to that server instead of indexing again.
+  `narsil-xref@.socket` starts the server on the first connection (systemd
+  socket activation), and a memory watchdog restarts it above
+  `--memory-hard-limit`.
+- **`get_commit_range` tool.** Lists the commits in `base..branch` and their
+  merge-base, oldest first.
+
+### Fixed
+
+- **Call graph.** Incoming calls survive file updates, call sites match by
+  line and name, and functions inside parse errors are kept.
 
 ## [1.7.0] - 2026-05-12
 
