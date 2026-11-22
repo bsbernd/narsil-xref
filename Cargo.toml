@@ -105,7 +105,6 @@ fs4 = "0.13"  # Cross-platform advisory file locking for the global stats file
 rayon = "1.10"  # Parallel iteration
 dashmap = "6.0"  # Concurrent hashmap
 uuid = { version = "1.0", features = ["v4", "serde"] }  # For generating unique streaming tokens
-chrono = "0.4"  # Date/time handling
 
 # LSP integration (native only)
 lsp-types = { version = "0.95", optional = true }  # LSP protocol types

@@ -12,6 +12,14 @@ use std::collections::{HashMap, HashSet};
 use super::{ArgExtractor, ToolHandler};
 use crate::callgraph::CallType;
 use crate::index::CodeIntelEngine;
+use crate::metrics::{now_unix_seconds, utc_date_and_time};
+
+/// The current UTC time in RFC 3339 form ("2024-02-29T23:59:59Z"), for
+/// `generated_at` of a graph.
+fn utc_now_rfc3339() -> String {
+    let (date, time) = utc_date_and_time(now_unix_seconds());
+    format!("{date}T{time}Z")
+}
 
 // ============================================================================
 // JSON Schema Types (matching frontend TypeScript interfaces)
@@ -381,7 +389,7 @@ impl GetCodeGraphHandler {
             metadata: GraphMetadata {
                 repo: options.repo.to_string(),
                 view: "call".to_string(),
-                generated_at: chrono::Utc::now().to_rfc3339(),
+                generated_at: utc_now_rfc3339(),
                 node_count: nodes.len(),
                 edge_count: edges.len(),
             },
@@ -476,7 +484,7 @@ impl GetCodeGraphHandler {
             metadata: GraphMetadata {
                 repo: options.repo.to_string(),
                 view: "import".to_string(),
-                generated_at: chrono::Utc::now().to_rfc3339(),
+                generated_at: utc_now_rfc3339(),
                 node_count: nodes.len(),
                 edge_count: edges.len(),
             },
@@ -554,7 +562,7 @@ impl GetCodeGraphHandler {
             metadata: GraphMetadata {
                 repo: options.repo.to_string(),
                 view: "symbol".to_string(),
-                generated_at: chrono::Utc::now().to_rfc3339(),
+                generated_at: utc_now_rfc3339(),
                 node_count: nodes.len(),
                 edge_count: edges.len(),
             },
@@ -620,7 +628,7 @@ impl GetCodeGraphHandler {
             metadata: GraphMetadata {
                 repo: options.repo.to_string(),
                 view: "hybrid".to_string(),
-                generated_at: chrono::Utc::now().to_rfc3339(),
+                generated_at: utc_now_rfc3339(),
                 node_count: nodes_map.len(),
                 edge_count: edges.len(),
             },
@@ -682,7 +690,7 @@ impl GetCodeGraphHandler {
             metadata: GraphMetadata {
                 repo: options.repo.to_string(),
                 view: "flow".to_string(),
-                generated_at: chrono::Utc::now().to_rfc3339(),
+                generated_at: utc_now_rfc3339(),
                 node_count: nodes.len(),
                 edge_count: edges.len(),
             },
