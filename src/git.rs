@@ -314,21 +314,7 @@ impl GitRepo {
                     commits.push(commit);
                 }
 
-                let parts: Vec<&str> = line.splitn(6, '|').collect();
-                if parts.len() >= 6 {
-                    current = Some(FileCommit {
-                        hash: parts[0].to_string(),
-                        short_hash: parts[1].to_string(),
-                        author: parts[2].to_string(),
-                        author_email: parts[3].to_string(),
-                        timestamp: parts[4].parse().unwrap_or(0),
-                        subject: parts[5].to_string(),
-                        body: String::new(),
-                        files_changed: 0,
-                        insertions: 0,
-                        deletions: 0,
-                    });
-                }
+                current = commit_from_log_header(line);
             } else if !line.is_empty() && current.is_some() {
                 // Numstat line: additions deletions filename
                 let parts: Vec<&str> = line.split_whitespace().collect();
@@ -799,17 +785,48 @@ impl GitRepo {
     }
 
     /// Find commits that modified a specific function/symbol, in the given
-    /// files. An empty `file_paths` searches the whole tree.
+    /// files, and the method that found them. An empty `file_paths` searches
+    /// the whole tree.
+    ///
+    /// git log -L lists every commit that changed the function's lines, also
+    /// under an earlier file name. git finds the function by its name at
+    /// the start of a line. When git finds none, as for a struct field or a
+    /// name used only in calls, -S lists the commits that add or remove the name.
     pub fn symbol_history(
         &self,
         file_paths: &[String],
         function_name: &str,
         max_commits: usize,
-    ) -> Result<Vec<FileCommit>> {
+    ) -> Result<(Vec<FileCommit>, String)> {
         for file_path in file_paths {
             Self::validate_input(file_path, "file_path")?;
         }
         Self::validate_input(function_name, "function_name")?;
+
+        let mut fallback_reason = "no file to search with git log -L".to_string();
+        if !file_paths.is_empty() {
+            let mut args = vec![
+                "log".to_string(),
+                "--format=%x00%H|%h|%an|%ae|%at|%s".to_string(),
+                format!("-{}", max_commits),
+            ];
+            // \< and \> stop xyz_a from matching the line of xyz_abc.
+            for file_path in file_paths {
+                args.push(format!("-L:\\<{}\\>:{}", function_name, file_path));
+            }
+            let output = Command::new("git")
+                .args(&args)
+                .current_dir(&self.root)
+                .output()
+                .context("Failed to run git log")?;
+            if output.status.success() {
+                let commits = parse_line_log_output(&String::from_utf8_lossy(&output.stdout));
+                let method = "git log -L (commits that changed the function's lines, \
+                              across renames; +/- counts lines inside the function)";
+                return Ok((commits, method.to_string()));
+            }
+            fallback_reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        }
 
         let mut args = vec![
             "log".to_string(),
@@ -833,7 +850,12 @@ impl GitRepo {
             return Err(anyhow!("git log -S failed: {}", err));
         }
 
-        self.parse_log_output(&String::from_utf8_lossy(&output.stdout))
+        let commits = self.parse_log_output(&String::from_utf8_lossy(&output.stdout))?;
+        let method = format!(
+            "git log -S (commits that add or remove the name; git log -L: {})",
+            fallback_reason
+        );
+        Ok((commits, method))
     }
 
     /// Get current branch name
@@ -1093,6 +1115,56 @@ fn truncate(s: &str, max: usize) -> String {
             crate::response_budget::truncate_on_char_boundary(s, max.saturating_sub(3))
         )
     }
+}
+
+/// The commit a `%H|%h|%an|%ae|%at|%s` log line describes, counts still zero.
+fn commit_from_log_header(line: &str) -> Option<FileCommit> {
+    let parts: Vec<&str> = line.splitn(6, '|').collect();
+    if parts.len() < 6 {
+        return None;
+    }
+    Some(FileCommit {
+        hash: parts[0].to_string(),
+        short_hash: parts[1].to_string(),
+        author: parts[2].to_string(),
+        author_email: parts[3].to_string(),
+        timestamp: parts[4].parse().unwrap_or(0),
+        subject: parts[5].to_string(),
+        body: String::new(),
+        files_changed: 0,
+        insertions: 0,
+        deletions: 0,
+    })
+}
+
+/// The commits of a `git log -L` run whose headers start with a NUL byte.
+/// -L refuses --numstat, so the counts are the +/- lines of each commit's
+/// diff, which -L cuts to the tracked lines.
+fn parse_line_log_output(output: &str) -> Vec<FileCommit> {
+    let mut commits: Vec<FileCommit> = Vec::new();
+    // The ---/+++ lines between "diff --git" and the first "@@" name files.
+    let mut in_file_header = false;
+    for line in output.lines() {
+        if let Some(header) = line.strip_prefix('\0') {
+            commits.extend(commit_from_log_header(header));
+            continue;
+        }
+        let Some(commit) = commits.last_mut() else {
+            continue;
+        };
+        if line.starts_with("diff --git ") {
+            commit.files_changed += 1;
+            in_file_header = true;
+        } else if line.starts_with("@@") {
+            in_file_header = false;
+        } else if in_file_header {
+        } else if line.starts_with('+') {
+            commit.insertions += 1;
+        } else if line.starts_with('-') {
+            commit.deletions += 1;
+        }
+    }
+    commits
 }
 
 /// The `git status --porcelain` two-letter codes for an unresolved merge:
@@ -1904,12 +1976,59 @@ mod tests {
 
         let repo = GitRepo::new(p).unwrap();
         let paths = vec!["a.c".to_string(), "b.c".to_string()];
-        let history = repo.symbol_history(&paths, "shared", 10).unwrap();
+        let (history, _) = repo.symbol_history(&paths, "shared", 10).unwrap();
         assert_eq!(history.len(), 1, "history was: {:?}", history);
         assert_eq!(history[0].subject, "add shared");
         // Regression: every commit came back as "+0 -0 across 0 file(s)".
         assert!(history[0].files_changed > 0, "{:?}", history[0]);
         assert!(history[0].insertions > 0, "{:?}", history[0]);
+    }
+
+    /// A body edit keeps the number of mentions of the name, so -S misses it.
+    /// The function's first commits sit under the file's earlier name.
+    #[test]
+    fn symbol_history_follows_the_function_body_across_a_rename() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        run_git(p, &["init", "-q"]);
+        let source = "int xyz_ab(void)\n{\n\treturn 0;\n}\n\n\
+                      int xyz_a(void)\n{\n\treturn 1;\n}\n\n\
+                      struct xyz_s {\n\tint xyz_field;\n};\n";
+        std::fs::write(p.join("xyz_old.c"), source).unwrap();
+        run_git(p, &["add", "xyz_old.c"]);
+        run_git(p, &["commit", "-q", "-m", "add xyz_a"]);
+        let source = source.replace("return 1;", "return 2;");
+        std::fs::write(p.join("xyz_old.c"), &source).unwrap();
+        run_git(p, &["commit", "-qa", "-m", "edit the xyz_a body"]);
+        run_git(p, &["mv", "xyz_old.c", "xyz_new.c"]);
+        run_git(p, &["commit", "-q", "-m", "rename the file"]);
+        let source = source.replace("return 0;", "return 9;");
+        std::fs::write(p.join("xyz_new.c"), source).unwrap();
+        run_git(p, &["commit", "-qa", "-m", "edit the xyz_ab body"]);
+
+        let repo = GitRepo::new(p).unwrap();
+        let paths = vec!["xyz_new.c".to_string()];
+        let (history, method) = repo.symbol_history(&paths, "xyz_a", 10).unwrap();
+        let subjects: Vec<&str> = history
+            .iter()
+            .map(|commit| commit.subject.as_str())
+            .collect();
+        assert_eq!(subjects, ["edit the xyz_a body", "add xyz_a"], "{method}");
+        assert!(method.starts_with("git log -L"), "{method}");
+        assert_eq!(
+            (
+                history[0].insertions,
+                history[0].deletions,
+                history[0].files_changed
+            ),
+            (1, 1, 1)
+        );
+
+        // A struct field starts no line, so git -L finds no function for it.
+        let (history, method) = repo.symbol_history(&paths, "xyz_field", 10).unwrap();
+        assert_eq!(history.len(), 1, "{history:?}");
+        assert!(method.starts_with("git log -S"), "{method}");
+        assert!(method.contains("no match"), "{method}");
     }
 
     #[test]

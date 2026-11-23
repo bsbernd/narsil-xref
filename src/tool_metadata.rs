@@ -852,7 +852,7 @@ lazy_static! {
 
         map.insert("get_symbol_history", ToolMetadata {
             name: "get_symbol_history",
-            description: "Get commits that modified a specific symbol/function. Requires --git flag.",
+            description: "Get commits that modified a specific symbol/function: git log -L over the function's lines, across renames; git log -S (commits adding or removing the name) when git finds no function of that name. The output names the method used. Requires --git flag.",
             category: ToolCategory::Git,
             tags: ["git", "symbol", "history", "commits"].iter().copied().collect(),
             stability: StabilityLevel::Stable,

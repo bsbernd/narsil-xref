@@ -171,7 +171,7 @@ takes ~13 s for one function and emits the false positives described below.
 | `get_hotspots` | — | Find code hotspots - files changed most often in the last `days`, with the most complex function of each file when the call graph is enabled (`min_complexity` then keeps files whose most complex function reaches it) |
 | `get_modified_files` | — | Get list of modified files in the working tree |
 | `get_recent_changes` | — | Get recent commits across the repository |
-| `get_symbol_history` | symbol | Get commits that modified a specific symbol/function |
+| `get_symbol_history` | symbol | Get commits that modified a specific symbol/function: git log -L over the function's lines, across renames; git log -S (commits adding or removing the name) when git finds no function of that name |
 
 ### `analysis`
 
