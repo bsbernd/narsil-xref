@@ -1120,6 +1120,10 @@ impl CfgBuilder {
         {
             let then_exit = self.process_block_node(then_block, then_body, source)?;
             self.add_edge(then_exit, merge_block, EdgeKind::FallThrough);
+        } else if let Some(then_body) = node.child_by_field_name("consequence") {
+            // C and JavaScript: a compound statement, or a single statement.
+            let then_exit = self.process_statement(then_block, then_body, source)?;
+            self.add_edge(then_exit, merge_block, EdgeKind::FallThrough);
         } else {
             self.add_edge(then_block, merge_block, EdgeKind::FallThrough);
         }
@@ -4072,5 +4076,53 @@ class Test {
 
         // Do-while should create body and condition blocks
         assert!(cfg.blocks.len() >= 3, "Do-while should create loop blocks");
+    }
+
+    /// The CFG of the only function in a C source.
+    fn c_function_cfg(source: &str) -> ControlFlowGraph {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut cfgs = analyze_function(&tree, source, "xyz.c").unwrap();
+        assert_eq!(cfgs.len(), 1);
+        cfgs.remove(0)
+    }
+
+    /// The block holding the statement that starts with `text`.
+    fn block_with_statement<'a>(cfg: &'a ControlFlowGraph, text: &str) -> &'a BasicBlock {
+        cfg.blocks
+            .values()
+            .find(|block| {
+                block
+                    .statements
+                    .iter()
+                    .any(|stmt| stmt.text.starts_with(text))
+            })
+            .unwrap_or_else(|| panic!("no block holds `{text}`"))
+    }
+
+    #[test]
+    fn test_c_if_body_lands_in_then_block() {
+        let cfg = c_function_cfg(
+            r#"
+int xyz_check(int a)
+{
+    if (a < 0) {
+        xyz_warn(a);
+    }
+    if (a > 9)
+        xyz_clamp(a);
+    return a;
+}
+"#,
+        );
+
+        for call in ["xyz_warn", "xyz_clamp"] {
+            let block = block_with_statement(&cfg, call);
+            assert_eq!(block.label, "then", "{call}");
+            assert!(!cfg.unreachable_blocks.contains(&block.id), "{call}");
+        }
     }
 }
