@@ -3732,7 +3732,7 @@ impl CodeIntelEngine {
             require_literal_leading_dot: false,
         };
 
-        let file_glob = file_pattern.and_then(|p| glob::Pattern::new(p).ok());
+        let file_glob = file_pattern.map(compile_file_pattern).transpose()?;
 
         let mut filtered: Vec<_> = symbols
             .iter()
@@ -4221,7 +4221,7 @@ impl CodeIntelEngine {
         // one repo; a single-repo search already knows where its hits live.
         let multi_repo = repos_to_search.len() > 1;
 
-        let glob = file_pattern.and_then(|p| glob::Pattern::new(p).ok());
+        let glob = file_pattern.map(compile_file_pattern).transpose()?;
 
         // Shared per-file gate: repo membership, test exclusion, file pattern.
         // Returns the repo-relative path when the file is in scope.
@@ -9290,6 +9290,24 @@ fn resolve_compile_command_file(
     None
 }
 
+/// The `file_pattern` glob of a find_symbols or search_code call. A bare file
+/// name matches at any depth.
+fn compile_file_pattern(pattern: &str) -> Result<glob::Pattern> {
+    let has_wildcard = pattern.contains(['*', '?', '[']);
+    let normalized = if !pattern.contains('/') && !has_wildcard {
+        format!("**/{}", pattern)
+    } else {
+        pattern.to_string()
+    };
+    glob::Pattern::new(&normalized).map_err(|e| {
+        anyhow!(
+            "Invalid file_pattern glob '{}': {} (examples: '**/README.md', 'src/**/*.rs')",
+            pattern,
+            e
+        )
+    })
+}
+
 fn compile_include_patterns(patterns: &[String]) -> Vec<glob::Pattern> {
     patterns
         .iter()
@@ -12130,6 +12148,39 @@ similarity index 90%
             !output.contains("compile_commands.json"),
             "a listed file must not carry the exclusion note:\n{output}"
         );
+    }
+
+    #[tokio::test]
+    async fn file_pattern_bare_name_matches_any_depth_and_bad_glob_is_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        write_file(&repo.join("src/widget.rs"), "pub fn widget_fn() {}\n");
+        let engine = CodeIntelEngine::with_options(
+            tmp.path().join("index"),
+            vec![repo.to_path_buf()],
+            EngineOptions::default(),
+        )
+        .await
+        .unwrap();
+        engine.complete_initialization().await.unwrap();
+        let repo_key = canonical_repo_key(repo).unwrap();
+
+        let output = engine
+            .find_symbols(&repo_key, None, Some("*"), Some("widget.rs"), None, 100)
+            .await
+            .unwrap();
+        assert!(output.contains("widget_fn"), "got:\n{output}");
+
+        let err = engine
+            .find_symbols(&repo_key, None, Some("*"), Some("[oops"), None, 100)
+            .await
+            .expect_err("find_symbols answered for every file");
+        assert!(err.to_string().contains("glob"), "got: {err}");
+        let err = engine
+            .search_code(Some(&repo_key), "widget_fn", Some("[oops"), 10, None, None)
+            .await
+            .expect_err("search_code answered for every file");
+        assert!(err.to_string().contains("glob"), "got: {err}");
     }
 
     #[test]
