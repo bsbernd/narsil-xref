@@ -4,6 +4,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{ArgExtractor, ToolHandler};
+use crate::git::{ChangeQuery, CommitFilter};
 use crate::index::CodeIntelEngine;
 
 /// Contributor rows returned when the caller passes no `limit`. Lower than the
@@ -80,7 +81,7 @@ impl ToolHandler for GetCommitRangeHandler {
 
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
-        let base = super::require_arg(&args, "base", "get_commit_range")?;
+        let base = args.get_str("base").filter(|base| !base.is_empty());
         let branch = args.get_str("branch").unwrap_or("HEAD");
         let paths: Vec<String> = args
             .get_array("paths")
@@ -88,10 +89,29 @@ impl ToolHandler for GetCommitRangeHandler {
             .flatten()
             .filter_map(|path| path.as_str().map(str::to_string))
             .collect();
+        let change = match args.get_str("query").filter(|query| !query.is_empty()) {
+            None => None,
+            Some(query) => match args.get_str_or("mode", "text").as_str() {
+                "text" => Some(ChangeQuery::Text(query)),
+                "regex" => Some(ChangeQuery::Regex(query)),
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "get_commit_range: mode must be 'text' or 'regex', got '{other}'"
+                    ))
+                }
+            },
+        };
+        let filter = CommitFilter {
+            paths: &paths,
+            change,
+            message: args
+                .get_str("message")
+                .filter(|message| !message.is_empty()),
+        };
         let include_body = args.get_bool_or("include_body", false);
         let window = super::list_window(&args, crate::response_budget::DEFAULT_LIST_LIMIT as u64);
         engine
-            .get_commit_range(repo, base, branch, &paths, include_body, window)
+            .get_commit_range(repo, base, branch, &filter, include_body, window)
             .await
     }
 }

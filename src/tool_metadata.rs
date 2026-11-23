@@ -757,7 +757,7 @@ lazy_static! {
 
         map.insert("get_commit_range", ToolMetadata {
             name: "get_commit_range",
-            description: "List commits in base..branch and their merge-base, oldest first. Requires --git flag.",
+            description: "List commits in base..branch (or all of branch) and their merge-base, oldest first; filter by path, by text a diff adds or removes (pickaxe), or by commit message. Requires --git flag.",
             category: ToolCategory::Git,
             tags: ["git", "commits", "history", "branch"].iter().copied().collect(),
             stability: StabilityLevel::Stable,
@@ -767,14 +767,17 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string"},
-                    "base": {"type": "string", "description": "Exclude commits reachable from this revision"},
+                    "base": {"type": "string", "description": "Exclude commits reachable from this revision (optional; omit to search the whole history of branch)"},
                     "branch": {"type": "string", "description": "Branch or revision to list (default: HEAD)"},
                     "paths": {"type": "array", "items": {"type": "string"}, "description": "Only commits that touch these repo-relative paths or directories (git log -- <paths>); deleted paths work"},
+                    "query": {"type": "string", "description": "Only commits whose diff adds or removes this text. Lists newest first without a total count, since counting diffs the whole range"},
+                    "mode": {"type": "string", "enum": ["text", "regex"], "description": "How query matches: text (default) = literal string whose occurrence count changes (git log -S); regex = added or removed line matching the regex (git log -G)"},
+                    "message": {"type": "string", "description": "Only commits whose message matches this case-sensitive regex (git log --grep)"},
                     "include_body": {"type": "boolean", "description": "Include commit bodies (default: false)"},
                     "limit": {"type": "integer", "minimum": 0, "description": "Maximum commits to return (default: 50; 0 = all)"},
-                    "offset": {"type": "integer", "minimum": 0, "description": "Index of the first commit to list, oldest first (default: 0)"}
+                    "offset": {"type": "integer", "minimum": 0, "description": "Index of the first commit to list, oldest first (newest first with query) (default: 0)"}
                 },
-                "required": ["repo", "base"]
+                "required": ["repo"]
             }),
             requires_api_key: false,
             aliases: vec![],

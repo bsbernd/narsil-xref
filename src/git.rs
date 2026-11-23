@@ -45,9 +45,30 @@ pub struct FileCommit {
 
 #[derive(Debug)]
 pub struct CommitRange {
-    pub merge_base: String,
-    pub total: usize,
+    /// None when no base was given.
+    pub merge_base: Option<String>,
+    /// None for a change search, which lists without counting.
+    pub total: Option<usize>,
     pub commits: Vec<FileCommit>,
+}
+
+/// Text a commit's diff adds or removes.
+#[derive(Debug, Clone, Copy)]
+pub enum ChangeQuery<'a> {
+    /// A literal string whose number of occurrences changes (git log -S).
+    Text(&'a str),
+    /// A regex matching an added or removed line (git log -G).
+    Regex(&'a str),
+}
+
+/// Which commits of a range get_commit_range lists.
+#[derive(Debug, Default)]
+pub struct CommitFilter<'a> {
+    /// Pathspec after `--`; empty lists every commit.
+    pub paths: &'a [String],
+    pub change: Option<ChangeQuery<'a>>,
+    /// Regex the commit message matches (git log --grep).
+    pub message: Option<&'a str>,
 }
 
 /// Change frequency data for a file
@@ -437,58 +458,99 @@ impl GitRepo {
 
     pub fn commit_range(
         &self,
-        base: &str,
+        base: Option<&str>,
         branch: &str,
-        paths: &[String],
+        filter: &CommitFilter,
         include_body: bool,
         window: crate::response_budget::ListWindow,
     ) -> Result<CommitRange> {
-        Self::validate_input(base, "base")?;
         Self::validate_input(branch, "branch")?;
-        for path in paths {
+        for path in filter.paths {
             Self::validate_input(path, "path")?;
         }
-        let base = self.git_output(&[
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            &format!("{base}^{{commit}}"),
-        ])?;
         let branch = self.git_output(&[
             "rev-parse",
             "--verify",
             "--end-of-options",
             &format!("{branch}^{{commit}}"),
         ])?;
-        let base = base.trim();
         let branch = branch.trim();
-        let merge_base = self.git_output(&["merge-base", base, branch])?;
-        let range = format!("{base}..{branch}");
-        let mut count_args = vec!["rev-list", "--count", &range, "--"];
-        count_args.extend(paths.iter().map(String::as_str));
-        let total: usize = self
-            .git_output(&count_args)?
-            .trim()
-            .parse()
-            .context("Invalid git commit count")?;
-        let offset = window.offset.min(total);
-        let remaining = total - offset;
-        let count = if window.limit == 0 {
-            remaining
-        } else {
-            remaining.min(window.limit)
+        let (range, merge_base) = match base {
+            Some(base) => {
+                Self::validate_input(base, "base")?;
+                let base = self.git_output(&[
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    &format!("{base}^{{commit}}"),
+                ])?;
+                let base = base.trim();
+                let merge_base = self.git_output(&["merge-base", base, branch])?;
+                (
+                    format!("{base}..{branch}"),
+                    Some(merge_base.trim().to_string()),
+                )
+            }
+            None => (branch.to_string(), None),
         };
+
+        // A pattern goes to git glued to its option, so git never parses the
+        // pattern as an option. validate_input would refuse regex characters.
+        let mut filter_args = Vec::new();
+        match filter.change {
+            Some(ChangeQuery::Text(text)) => filter_args.push(format!("-S{text}")),
+            Some(ChangeQuery::Regex(regex)) => filter_args.push(format!("-G{regex}")),
+            None => {}
+        }
+        if let Some(message) = filter.message {
+            filter_args.push(format!("--grep={message}"));
+        }
         let mut result = CommitRange {
-            merge_base: merge_base.trim().to_string(),
-            total,
+            merge_base,
+            total: None,
             commits: Vec::new(),
         };
-        if count == 0 {
-            return Ok(result);
-        }
 
-        // Git applies skip and max-count before reversing the commit order.
-        let skip = total - offset - count;
+        let (order_args, skip, count) = if filter.change.is_some() {
+            // rev-list --count with -S or -G diffs every commit in the range,
+            // minutes on a large history. List newest first without a total.
+            // git log reads --max-count=-1 as no limit.
+            let count = if window.limit == 0 {
+                "-1".to_string()
+            } else {
+                window.limit.to_string()
+            };
+            (Vec::new(), window.offset, count)
+        } else {
+            let mut count_args = vec!["rev-list", "--count"];
+            count_args.extend(filter_args.iter().map(String::as_str));
+            count_args.extend([range.as_str(), "--"]);
+            count_args.extend(filter.paths.iter().map(String::as_str));
+            let total: usize = self
+                .git_output(&count_args)?
+                .trim()
+                .parse()
+                .context("Invalid git commit count")?;
+            result.total = Some(total);
+            let offset = window.offset.min(total);
+            let remaining = total - offset;
+            let count = if window.limit == 0 {
+                remaining
+            } else {
+                remaining.min(window.limit)
+            };
+            if count == 0 {
+                return Ok(result);
+            }
+
+            // Git applies skip and max-count before reversing the commit order.
+            (
+                vec!["--topo-order", "--reverse"],
+                total - offset - count,
+                count.to_string(),
+            )
+        };
+
         let format = if include_body {
             "--format=%H%x00%h%x00%an%x00%ae%x00%at%x00%s%x00%b"
         } else {
@@ -496,18 +558,12 @@ impl GitRepo {
         };
         let skip = format!("--skip={skip}");
         let max_count = format!("--max-count={count}");
-        let mut log_args = vec![
-            "log",
-            "--topo-order",
-            "--reverse",
-            "-z",
-            format,
-            &skip,
-            &max_count,
-            &range,
-            "--",
-        ];
-        log_args.extend(paths.iter().map(String::as_str));
+        let mut log_args = vec!["log"];
+        log_args.extend(order_args);
+        log_args.extend(["-z", format, &skip, &max_count]);
+        log_args.extend(filter_args.iter().map(String::as_str));
+        log_args.extend([range.as_str(), "--"]);
+        log_args.extend(filter.paths.iter().map(String::as_str));
         let output = self.git_output(&log_args)?;
         let fields: Vec<&str> = output.split_terminator('\0').collect();
         let (records, remainder) = fields.as_chunks::<7>();
@@ -1180,14 +1236,22 @@ mod tests {
         );
         let git = GitRepo::new(path).unwrap();
         let first = git
-            .commit_range("base", "topic", &[], true, ListWindow::new(0, 2))
+            .commit_range(
+                Some("base"),
+                "topic",
+                &CommitFilter::default(),
+                true,
+                ListWindow::new(0, 2),
+            )
             .unwrap();
-        assert_eq!(first.total, 3);
+        assert_eq!(first.total, Some(3));
         assert_eq!(
-            first.merge_base,
-            std::fs::read_to_string(path.join(".git/refs/tags/fork"))
-                .unwrap()
-                .trim()
+            first.merge_base.as_deref(),
+            Some(
+                std::fs::read_to_string(path.join(".git/refs/tags/fork"))
+                    .unwrap()
+                    .trim()
+            )
         );
         assert_eq!(first.commits.len(), 2);
         assert_eq!(first.commits[0].subject, "first | subject");
@@ -1195,35 +1259,71 @@ mod tests {
         assert_eq!(first.commits[1].subject, "second");
 
         let last = git
-            .commit_range("base", "topic", &[], false, ListWindow::new(2, 2))
+            .commit_range(
+                Some("base"),
+                "topic",
+                &CommitFilter::default(),
+                false,
+                ListWindow::new(2, 2),
+            )
             .unwrap();
-        assert_eq!(last.total, 3);
+        assert_eq!(last.total, Some(3));
         assert_eq!(last.commits.len(), 1);
         assert_eq!(last.commits[0].subject, "third");
         let all = git
-            .commit_range("base", "topic", &[], false, ListWindow::new(0, 0))
+            .commit_range(
+                Some("base"),
+                "topic",
+                &CommitFilter::default(),
+                false,
+                ListWindow::new(0, 0),
+            )
             .unwrap();
         assert_eq!(all.commits.len(), 3);
         assert!(all.commits.iter().all(|commit| commit.body.is_empty()));
         assert_eq!(all.commits[0].hash, first.commits[0].hash);
         assert_eq!(all.commits[2].hash, last.commits[0].hash);
         assert!(git
-            .commit_range("base", "topic", &[], false, ListWindow::new(99, 2))
+            .commit_range(
+                Some("base"),
+                "topic",
+                &CommitFilter::default(),
+                false,
+                ListWindow::new(99, 2)
+            )
             .unwrap()
             .commits
             .is_empty());
         let empty = git
-            .commit_range("topic", "topic", &[], false, ListWindow::new(0, 2))
+            .commit_range(
+                Some("topic"),
+                "topic",
+                &CommitFilter::default(),
+                false,
+                ListWindow::new(0, 2),
+            )
             .unwrap();
-        assert_eq!(empty.total, 0);
+        assert_eq!(empty.total, Some(0));
         assert!(empty.commits.is_empty());
         for base in ["missing", "--all"] {
             assert!(git
-                .commit_range(base, "topic", &[], false, ListWindow::new(0, 2))
+                .commit_range(
+                    Some(base),
+                    "topic",
+                    &CommitFilter::default(),
+                    false,
+                    ListWindow::new(0, 2)
+                )
                 .is_err());
         }
         assert!(git
-            .commit_range("base", "missing", &[], false, ListWindow::new(0, 2))
+            .commit_range(
+                Some("base"),
+                "missing",
+                &CommitFilter::default(),
+                false,
+                ListWindow::new(0, 2)
+            )
             .is_err());
 
         let index = TempDir::new().unwrap();
@@ -1241,16 +1341,19 @@ mod tests {
         let output = engine
             .get_commit_range(
                 path.to_str().unwrap(),
-                "base",
+                Some("base"),
                 "topic",
-                &[],
+                &CommitFilter::default(),
                 true,
                 ListWindow::new(0, 2),
             )
             .await
             .unwrap();
         assert!(
-            output.contains(&format!("Merge base: `{}`", first.merge_base)),
+            output.contains(&format!(
+                "Merge base: `{}`",
+                first.merge_base.as_ref().unwrap()
+            )),
             "{output}"
         );
         assert!(output.contains("First line\n  Second | line"), "{output}");
@@ -1265,12 +1368,24 @@ mod tests {
             &["merge", "-q", "--no-ff", "-m", "merge side", "side"],
         );
         let merged = git
-            .commit_range("base", "topic", &[], false, ListWindow::new(0, 0))
+            .commit_range(
+                Some("base"),
+                "topic",
+                &CommitFilter::default(),
+                false,
+                ListWindow::new(0, 0),
+            )
             .unwrap();
-        assert_eq!(merged.total, 5);
+        assert_eq!(merged.total, Some(5));
         for (offset, expected) in merged.commits.iter().enumerate() {
             let page = git
-                .commit_range("base", "topic", &[], false, ListWindow::new(offset, 1))
+                .commit_range(
+                    Some("base"),
+                    "topic",
+                    &CommitFilter::default(),
+                    false,
+                    ListWindow::new(offset, 1),
+                )
                 .unwrap();
             assert_eq!(page.commits[0].hash, expected.hash);
         }
@@ -1301,11 +1416,15 @@ mod tests {
         run_git(path, &["commit", "-q", "-m", "remove xyz_gone"]);
         let git = GitRepo::new(path).unwrap();
         let subjects = |paths: &[String], window| -> (usize, Vec<String>) {
+            let filter = CommitFilter {
+                paths,
+                ..Default::default()
+            };
             let range = git
-                .commit_range("base", "topic", paths, false, window)
+                .commit_range(Some("base"), "topic", &filter, false, window)
                 .unwrap();
             let listed = range.commits.into_iter().map(|commit| commit.subject);
-            (range.total, listed.collect())
+            (range.total.unwrap(), listed.collect())
         };
 
         let directory_paths = vec!["xyz_dir".to_string()];
@@ -1334,11 +1453,126 @@ mod tests {
         let repo = path.to_str().unwrap();
         for outside in ["../xyz_b.c", "/etc"] {
             let paths = vec![outside.to_string()];
+            let filter = CommitFilter {
+                paths: &paths,
+                ..Default::default()
+            };
             assert!(engine
-                .get_commit_range(repo, "base", "topic", &paths, false, ListWindow::new(0, 0))
+                .get_commit_range(
+                    repo,
+                    Some("base"),
+                    "topic",
+                    &filter,
+                    false,
+                    ListWindow::new(0, 0)
+                )
                 .await
                 .is_err());
         }
+    }
+
+    /// -S lists a commit only when the count of the text changes, -G any
+    /// commit whose added or removed lines match. Without a base the search
+    /// covers the whole history.
+    #[tokio::test]
+    async fn commit_range_searches_diffs_and_messages() {
+        use crate::response_budget::ListWindow;
+
+        let directory = TempDir::new().unwrap();
+        let path = directory.path();
+        run_git(path, &["init", "-q"]);
+        for (file, content, subject) in [
+            ("xyz.c", "int xyz_alpha = 1;\n", "add xyz_alpha"),
+            (
+                "xyz.c",
+                "int xyz_alpha = 2;\n",
+                "change the xyz_alpha value",
+            ),
+            ("xyz_other.c", "int xyz_beta;\n", "add xyz_beta"),
+            ("xyz.c", "", "remove xyz_alpha"),
+        ] {
+            std::fs::write(path.join(file), content).unwrap();
+            run_git(path, &["add", file]);
+            run_git(path, &["commit", "-q", "-m", subject]);
+        }
+        let git = GitRepo::new(path).unwrap();
+        let search = |filter: &CommitFilter, window| -> (Option<usize>, Vec<String>) {
+            let range = git
+                .commit_range(None, "HEAD", filter, false, window)
+                .unwrap();
+            let listed = range.commits.into_iter().map(|commit| commit.subject);
+            (range.total, listed.collect())
+        };
+
+        let text = CommitFilter {
+            change: Some(ChangeQuery::Text("xyz_alpha")),
+            ..Default::default()
+        };
+        assert_eq!(
+            search(&text, ListWindow::new(0, 0)),
+            (
+                None,
+                vec!["remove xyz_alpha".into(), "add xyz_alpha".into()]
+            )
+        );
+        assert_eq!(search(&text, ListWindow::new(1, 1)).1, ["add xyz_alpha"]);
+        let regex = CommitFilter {
+            change: Some(ChangeQuery::Regex("xyz_al.ha = [12]")),
+            ..Default::default()
+        };
+        assert_eq!(
+            search(&regex, ListWindow::new(0, 0)).1,
+            [
+                "remove xyz_alpha",
+                "change the xyz_alpha value",
+                "add xyz_alpha"
+            ]
+        );
+        let other_paths = vec!["xyz_other.c".to_string()];
+        let elsewhere = CommitFilter {
+            paths: &other_paths,
+            change: Some(ChangeQuery::Text("xyz_alpha")),
+            ..Default::default()
+        };
+        assert!(search(&elsewhere, ListWindow::new(0, 0)).1.is_empty());
+        let message = CommitFilter {
+            message: Some("the .* value"),
+            ..Default::default()
+        };
+        assert_eq!(
+            search(&message, ListWindow::new(0, 0)),
+            (Some(1), vec!["change the xyz_alpha value".into()])
+        );
+
+        let index = TempDir::new().unwrap();
+        let engine = crate::index::CodeIntelEngine::with_options(
+            index.path().to_path_buf(),
+            vec![path.to_path_buf()],
+            crate::index::EngineOptions {
+                git_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        engine.complete_initialization().await.unwrap();
+        let output = engine
+            .get_commit_range(
+                path.to_str().unwrap(),
+                None,
+                "HEAD",
+                &text,
+                false,
+                ListWindow::new(0, 1),
+            )
+            .await
+            .unwrap();
+        assert!(output.contains("remove xyz_alpha (t, "), "{output}");
+        assert!(!output.contains("Merge base"), "{output}");
+        assert!(
+            output.contains("1 shown, more may exist. Next page: get_commit_range(offset=1)"),
+            "{output}"
+        );
     }
 
     /// A submodule's file is absent from the superproject's HEAD, so blame and
