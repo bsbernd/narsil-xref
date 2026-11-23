@@ -709,10 +709,11 @@ impl LanguageParser {
 /// tree-sitter-c turns a function whose `if (...) {` is split across `#if` and
 /// `#else` into an ERROR node, so the function has no symbol and no calls.
 /// For a C or C++ file with ERROR nodes, a copy that keeps only the first
-/// branch of each `#if` group is parsed too. That tree wins only when its ERROR
-/// nodes cover fewer bytes: an unrelated ERROR elsewhere in the file can keep
-/// the number of ERROR nodes equal. A file without ERROR nodes keeps its tree,
-/// which still holds the calls in `#else` branches.
+/// branch of each `#if` group shows which functions the original tree breaks.
+/// A second copy keeps only the first branch of the groups that overlap such a
+/// function, so every other function keeps the calls in its `#else` branches.
+/// That tree wins only when its ERROR nodes cover fewer bytes: an unrelated
+/// ERROR elsewhere in the file can keep the number of ERROR nodes equal.
 fn parse_source(parser: &mut Parser, language_name: &str, content: &str) -> Result<Tree> {
     let tree = parser
         .parse(content, None)
@@ -720,61 +721,118 @@ fn parse_source(parser: &mut Parser, language_name: &str, content: &str) -> Resu
     if !matches!(language_name, "c" | "cpp") || !tree.root_node().has_error() {
         return Ok(tree);
     }
-    let first_branches = keep_first_preprocessor_branches(content);
-    let Some(first_branch_tree) = parser.parse(&first_branches, None) else {
+    let groups = preprocessor_groups(content);
+    let Some(first_branch_tree) = parser.parse(keep_first_branches(content, &groups), None) else {
         return Ok(tree);
     };
-    if error_bytes(&first_branch_tree) < error_bytes(&tree) {
-        return Ok(first_branch_tree);
+    let broken_functions = functions_broken_in(&tree, &first_branch_tree);
+    let broken_groups: Vec<PreprocessorGroup> = groups
+        .into_iter()
+        .filter(|group| {
+            let group_range = group.if_line.start..group.later_branches.end;
+            broken_functions.iter().any(|function| {
+                function.start < group_range.end && group_range.start < function.end
+            })
+        })
+        .collect();
+    let Some(repaired_tree) = parser.parse(keep_first_branches(content, &broken_groups), None)
+    else {
+        return Ok(tree);
+    };
+    if error_bytes(&repaired_tree) < error_bytes(&tree) {
+        return Ok(repaired_tree);
     }
     Ok(tree)
 }
 
-/// A copy of `content` that holds only the first branch of each `#if` group with
-/// an `#elif` or `#else`, so the parser sees one well-formed version of the code.
+/// An `#if` group with an `#elif` or `#else`.
+struct PreprocessorGroup {
+    if_line: Range<usize>,
+    /// From the first `#elif` or `#else` line to the end of the `#endif` line.
+    later_branches: Range<usize>,
+}
+
+/// The `#if` groups of `content` that have a later branch, inner groups too.
+fn preprocessor_groups(content: &str) -> Vec<PreprocessorGroup> {
+    struct OpenGroup {
+        if_line: Range<usize>,
+        later_start: Option<usize>,
+    }
+
+    let mut groups = Vec::new();
+    let mut open_groups: Vec<OpenGroup> = Vec::new();
+    let mut line_start = 0;
+    while line_start < content.len() {
+        let line = logical_line_at(content, line_start);
+        match directive_name(&content[line.clone()]) {
+            "if" | "ifdef" | "ifndef" => open_groups.push(OpenGroup {
+                if_line: line.clone(),
+                later_start: None,
+            }),
+            "elif" | "elifdef" | "elifndef" | "else" => {
+                if let Some(group) = open_groups.last_mut() {
+                    group.later_start.get_or_insert(line.start);
+                }
+            }
+            "endif" => {
+                if let Some(OpenGroup {
+                    if_line,
+                    later_start: Some(later_start),
+                }) = open_groups.pop()
+                {
+                    groups.push(PreprocessorGroup {
+                        if_line,
+                        later_branches: later_start..line.end,
+                    });
+                }
+            }
+            _ => {}
+        }
+        line_start = line.end + 1;
+    }
+    groups
+}
+
+/// A copy of `content` that holds only the first branch of each of `groups`, so
+/// the parser sees one well-formed version of that code.
 ///
 /// The group's directive lines and later branches become spaces. Newlines stay,
 /// so every byte keeps its offset, line and column, and the tree of the copy
 /// reads the same text as the tree of `content` outside the blanked bytes.
-fn keep_first_preprocessor_branches(content: &str) -> Vec<u8> {
-    struct Group {
-        if_line: Range<usize>,
-        in_later_branch: bool,
-    }
-
+fn keep_first_branches(content: &str, groups: &[PreprocessorGroup]) -> Vec<u8> {
     let mut copy = content.as_bytes().to_vec();
-    let mut groups: Vec<Group> = Vec::new();
-    let mut line_start = 0;
-    while line_start < content.len() {
-        let line = logical_line_at(content, line_start);
-        let inside_later_branch = groups.iter().any(|group| group.in_later_branch);
-        let blank = match directive_name(&content[line.clone()]) {
-            "if" | "ifdef" | "ifndef" => {
-                groups.push(Group {
-                    if_line: line.clone(),
-                    in_later_branch: false,
-                });
-                inside_later_branch
-            }
-            "elif" | "elifdef" | "elifndef" | "else" => {
-                if let Some(group) = groups.last_mut() {
-                    group.in_later_branch = true;
-                    blank_bytes(&mut copy, group.if_line.clone());
-                }
-                true
-            }
-            "endif" => {
-                groups.pop();
-                inside_later_branch
-            }
-            _ => inside_later_branch,
-        };
-        if blank {
-            blank_bytes(&mut copy, line.clone());
-        }
-        line_start = line.end + 1;
+    for group in groups {
+        blank_bytes(&mut copy, group.if_line.clone());
+        blank_bytes(&mut copy, group.later_branches.clone());
     }
     copy
+}
+
+/// Byte ranges of the functions of `first_branch_tree` that `tree` has no
+/// definition without errors for.
+fn functions_broken_in(tree: &Tree, first_branch_tree: &Tree) -> Vec<Range<usize>> {
+    let mut broken = Vec::new();
+    let mut stack = vec![first_branch_tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() != "function_definition" {
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+            continue;
+        }
+        let range = node.byte_range();
+        let original = tree
+            .root_node()
+            .descendant_for_byte_range(range.start, range.end);
+        let parses_in_tree = original.is_some_and(|original| {
+            original.kind() == "function_definition"
+                && original.byte_range() == range
+                && !original.has_error()
+        });
+        if !parses_in_tree {
+            broken.push(range);
+        }
+    }
+    broken
 }
 
 /// The byte range of the line starting at `start`, extended over the lines a
