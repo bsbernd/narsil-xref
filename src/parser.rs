@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use std::cell::RefCell;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use streaming_iterator::StreamingIterator;
@@ -552,9 +553,7 @@ impl LanguageParser {
         let mut parser = Parser::new();
         parser.set_language(&lazy_config.config.language)?;
 
-        let tree = parser
-            .parse(content, None)
-            .ok_or_else(|| anyhow!("Failed to parse file"))?;
+        let tree = parse_source(&mut parser, &lazy_config.config.name, content)?;
 
         let symbols = self.extract_symbols(&tree, content, lazy_config)?;
 
@@ -598,9 +597,7 @@ impl LanguageParser {
             let mut scratch = scratch.borrow_mut();
             let (parser, cursor) = &mut *scratch;
             parser.set_language(&lazy_config.config.language)?;
-            let tree = parser
-                .parse(content, None)
-                .ok_or_else(|| anyhow!("Failed to parse file"))?;
+            let tree = parse_source(parser, &lazy_config.config.name, content)?;
 
             let source_bytes = content.as_bytes();
             let mut names = Vec::new();
@@ -705,6 +702,132 @@ impl LanguageParser {
 
         Ok(symbols)
     }
+}
+
+/// Parse `content` into the tree that symbol extraction and the call graph read.
+///
+/// tree-sitter-c turns a function whose `if (...) {` is split across `#if` and
+/// `#else` into an ERROR node, so the function has no symbol and no calls.
+/// For a C or C++ file with ERROR nodes, a copy that keeps only the first
+/// branch of each `#if` group is parsed too. That tree wins only when its ERROR
+/// nodes cover fewer bytes: an unrelated ERROR elsewhere in the file can keep
+/// the number of ERROR nodes equal. A file without ERROR nodes keeps its tree,
+/// which still holds the calls in `#else` branches.
+fn parse_source(parser: &mut Parser, language_name: &str, content: &str) -> Result<Tree> {
+    let tree = parser
+        .parse(content, None)
+        .ok_or_else(|| anyhow!("Failed to parse file"))?;
+    if !matches!(language_name, "c" | "cpp") || !tree.root_node().has_error() {
+        return Ok(tree);
+    }
+    let first_branches = keep_first_preprocessor_branches(content);
+    let Some(first_branch_tree) = parser.parse(&first_branches, None) else {
+        return Ok(tree);
+    };
+    if error_bytes(&first_branch_tree) < error_bytes(&tree) {
+        return Ok(first_branch_tree);
+    }
+    Ok(tree)
+}
+
+/// A copy of `content` that holds only the first branch of each `#if` group with
+/// an `#elif` or `#else`, so the parser sees one well-formed version of the code.
+///
+/// The group's directive lines and later branches become spaces. Newlines stay,
+/// so every byte keeps its offset, line and column, and the tree of the copy
+/// reads the same text as the tree of `content` outside the blanked bytes.
+fn keep_first_preprocessor_branches(content: &str) -> Vec<u8> {
+    struct Group {
+        if_line: Range<usize>,
+        in_later_branch: bool,
+    }
+
+    let mut copy = content.as_bytes().to_vec();
+    let mut groups: Vec<Group> = Vec::new();
+    let mut line_start = 0;
+    while line_start < content.len() {
+        let line = logical_line_at(content, line_start);
+        let inside_later_branch = groups.iter().any(|group| group.in_later_branch);
+        let blank = match directive_name(&content[line.clone()]) {
+            "if" | "ifdef" | "ifndef" => {
+                groups.push(Group {
+                    if_line: line.clone(),
+                    in_later_branch: false,
+                });
+                inside_later_branch
+            }
+            "elif" | "elifdef" | "elifndef" | "else" => {
+                if let Some(group) = groups.last_mut() {
+                    group.in_later_branch = true;
+                    blank_bytes(&mut copy, group.if_line.clone());
+                }
+                true
+            }
+            "endif" => {
+                groups.pop();
+                inside_later_branch
+            }
+            _ => inside_later_branch,
+        };
+        if blank {
+            blank_bytes(&mut copy, line.clone());
+        }
+        line_start = line.end + 1;
+    }
+    copy
+}
+
+/// The byte range of the line starting at `start`, extended over the lines a
+/// trailing backslash continues, without the final newline.
+fn logical_line_at(content: &str, start: usize) -> Range<usize> {
+    let mut end = start;
+    loop {
+        end = content[end..]
+            .find('\n')
+            .map_or(content.len(), |newline| end + newline);
+        let continued = content[start..end].trim_end_matches('\r').ends_with('\\');
+        if !continued || end == content.len() {
+            return start..end;
+        }
+        end += 1;
+    }
+}
+
+/// The directive word of a preprocessor line ("if", "else", ...), else "".
+fn directive_name(line: &str) -> &str {
+    let Some(rest) = line.trim_start().strip_prefix('#') else {
+        return "";
+    };
+    let rest = rest.trim_start();
+    let word_len = rest
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(rest.len());
+    &rest[..word_len]
+}
+
+/// Replace every byte in `range` except newlines with a space.
+fn blank_bytes(bytes: &mut [u8], range: Range<usize>) {
+    for byte in &mut bytes[range] {
+        if *byte != b'\n' {
+            *byte = b' ';
+        }
+    }
+}
+
+/// Bytes of the source inside ERROR nodes, nested ERROR nodes counted once.
+fn error_bytes(tree: &Tree) -> usize {
+    let mut bytes = 0;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.is_error() {
+            bytes += node.byte_range().len();
+        } else if node.has_error() {
+            // has_error() covers the subtree, so a clean subtree is not walked.
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+        }
+    }
+    bytes
 }
 
 /// Append a Function symbol for every `SYSCALL_DEFINEn` / `COMPAT_SYSCALL_DEFINEn`

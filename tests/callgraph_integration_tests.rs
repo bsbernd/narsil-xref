@@ -692,6 +692,97 @@ static int later_function(int value)
 }
 
 #[test]
+fn test_c_preprocessor_split_if_keeps_function_and_calls() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let code = r#"
+int xyz_reply(int error)
+{
+#if XYZ_FEATURE
+    const char *text = xyz_describe(error);
+    if (text == NULL || error > 0) {
+#else
+    if (error <= -1000 || error > 0) {
+#endif
+        error = -1;
+    }
+
+    return xyz_send(error);
+}
+
+static int xyz_after(int value)
+{
+    return xyz_finish(value);
+}
+"#;
+
+    let parsed = parser.parse_file(Path::new("reply.c"), code).unwrap();
+    assert!(
+        parsed.symbols.iter().any(|s| s.name == "xyz_reply"),
+        "xyz_reply has no symbol, got: {:?}",
+        parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+
+    let tree = parsed.tree.unwrap();
+    let files = vec![("reply.c".to_string(), code.to_string(), tree)];
+    call_graph.build_from_files(&files).unwrap();
+
+    let reply_callees: Vec<String> = call_graph
+        .get_callees("xyz_reply")
+        .into_iter()
+        .map(|e| e.target)
+        .collect();
+    assert!(
+        reply_callees.iter().any(|t| t.ends_with("xyz_send")),
+        "xyz_reply should call xyz_send, got: {:?}",
+        reply_callees
+    );
+    assert!(!reply_callees.iter().any(|t| t.ends_with("xyz_finish")));
+
+    let after_callees: Vec<String> = call_graph
+        .get_callees("xyz_after")
+        .into_iter()
+        .map(|e| e.target)
+        .collect();
+    assert_eq!(after_callees.len(), 1, "got: {:?}", after_callees);
+    assert!(after_callees[0].ends_with("xyz_finish"));
+}
+
+#[test]
+fn test_c_call_only_in_else_branch_stays_without_parse_errors() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let code = r#"
+int xyz_reply(int error)
+{
+#if XYZ_FEATURE
+    return xyz_describe(error);
+#else
+    return xyz_send(error);
+#endif
+}
+"#;
+
+    let parsed = parser.parse_file(Path::new("reply.c"), code).unwrap();
+    let tree = parsed.tree.unwrap();
+    let files = vec![("reply.c".to_string(), code.to_string(), tree)];
+    call_graph.build_from_files(&files).unwrap();
+
+    let callees: Vec<String> = call_graph
+        .get_callees("xyz_reply")
+        .into_iter()
+        .map(|e| e.target)
+        .collect();
+    assert!(
+        callees.iter().any(|t| t.ends_with("xyz_send")),
+        "the #else branch call to xyz_send is lost, got: {:?}",
+        callees
+    );
+}
+
+#[test]
 fn test_c_call_graph_without_parse_errors_has_no_degraded_regions() {
     let parser = LanguageParser::new().unwrap();
     let call_graph = CallGraph::new();
@@ -799,8 +890,8 @@ async fn get_callers_limit_zero_is_not_served_the_cached_page() {
     assert!(!full.contains("Showing"), "{}", full);
 }
 
-/// A repo with one C file whose only function has an `if` split across
-/// #if/#else/#endif — tree-sitter cannot see this function or its calls at
+/// A repo with one C file whose only function opens an `if` in one #ifdef block
+/// and closes one in another — tree-sitter cannot see this function or its calls at
 /// all, so get_callers/get_callees must say the call graph may be incomplete
 /// rather than presenting an empty or partial answer as exhaustive.
 fn write_preprocessor_split_repo(root: &std::path::Path) -> std::io::Result<()> {
@@ -813,11 +904,12 @@ int send_reply_nofree(int req, int error, int len)
 {
 	int out;
 
-#if __GLIBC__ >= 2 && __GLIBC_MINOR__ >= 32
-	const char *str = "err";
-	if ((str == 0 && error != 0) || error > 0) {
-#else
-	if (error <= -1000 || error > 0) {
+#ifdef CHECK_ERROR
+	if (error > 0) {
+#endif
+	if (error < 0) {
+#ifdef CHECK_ERROR
+	}
 #endif
 		error = -1;
 	}
