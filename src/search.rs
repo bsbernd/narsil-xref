@@ -97,8 +97,10 @@ impl Default for BM25Params {
 
 /// Code-aware search index using BM25
 pub struct SearchIndex {
-    /// All documents
-    documents: Vec<SearchDocument>,
+    /// All documents. A document a re-index replaced is None. Its postings still point here.
+    documents: Vec<Option<SearchDocument>>,
+    /// Position in `documents` of the live document per (repo, id)
+    live_documents: HashMap<(String, String), usize>,
     /// Inverted index: term -> document indices
     inverted_index: HashMap<String, Vec<usize>>,
     /// Document frequency per term
@@ -123,6 +125,7 @@ impl SearchIndex {
     pub fn new() -> Self {
         Self {
             documents: Vec::new(),
+            live_documents: HashMap::new(),
             inverted_index: HashMap::new(),
             doc_freq: HashMap::new(),
             total_tokens: 0,
@@ -184,9 +187,13 @@ impl SearchIndex {
         synonyms
     }
 
-    /// Add a document to the index
+    /// Add a document to the index, replacing the one with the same repo and id
     pub fn add_document(&mut self, doc: SearchDocument) {
         let doc_idx = self.documents.len();
+        let key = (doc.repo.clone(), doc.id.clone());
+        if let Some(replaced_idx) = self.live_documents.insert(key, doc_idx) {
+            self.remove_document(replaced_idx);
+        }
 
         // Build inverted index from term_freq, preserving per-occurrence multiplicity
         for (token, &count) in &doc.term_freq {
@@ -202,8 +209,25 @@ impl SearchIndex {
         }
 
         self.total_tokens += doc.doc_len;
-        self.documents.push(doc);
-        self.avg_doc_len = self.total_tokens as f64 / self.documents.len() as f64;
+        self.documents.push(Some(doc));
+        self.avg_doc_len = self.total_tokens as f64 / self.live_documents.len() as f64;
+    }
+
+    /// Stop a replaced document from matching and from counting in the BM25 statistics.
+    ///
+    /// Its postings stay: dropping them would scan every posting list of its
+    /// terms, and search skips postings of a removed document.
+    fn remove_document(&mut self, doc_idx: usize) {
+        let doc = self.documents[doc_idx]
+            .take()
+            .expect("live_documents points at a live document");
+        for token in doc.term_freq.keys() {
+            *self
+                .doc_freq
+                .get_mut(token)
+                .expect("every term of a live document has a doc_freq") -= 1;
+        }
+        self.total_tokens -= doc.doc_len;
     }
 
     /// Index content from a file
@@ -260,7 +284,9 @@ impl SearchIndex {
                 let idf = self.compute_idf(token);
 
                 for &doc_idx in doc_indices {
-                    let doc = &self.documents[doc_idx];
+                    let Some(doc) = &self.documents[doc_idx] else {
+                        continue;
+                    };
                     let tf = doc.term_freq.get(token).copied().unwrap_or(0) as f64;
                     let doc_len = doc.doc_len as f64;
 
@@ -277,7 +303,9 @@ impl SearchIndex {
 
         // Boost exact name matches
         for (doc_idx, (score, _)) in &mut scores {
-            let doc = &self.documents[*doc_idx];
+            let doc = self.documents[*doc_idx]
+                .as_ref()
+                .expect("scored a removed document");
             if doc.id.to_lowercase().contains(&query.to_lowercase()) {
                 *score *= 2.0;
             }
@@ -295,7 +323,9 @@ impl SearchIndex {
         results
             .into_iter()
             .map(|(doc_idx, (score, matched_terms))| {
-                let doc = self.documents[doc_idx].clone();
+                let doc = self.documents[doc_idx]
+                    .clone()
+                    .expect("scored a removed document");
                 let snippet = self.generate_snippet(&doc, &matched_terms);
 
                 SearchResult {
@@ -310,7 +340,7 @@ impl SearchIndex {
 
     /// Compute IDF (Inverse Document Frequency)
     fn compute_idf(&self, term: &str) -> f64 {
-        let n = self.documents.len() as f64;
+        let n = self.live_documents.len() as f64;
         let df = self.doc_freq.get(term).copied().unwrap_or(0) as f64;
 
         if df == 0.0 {
@@ -355,13 +385,16 @@ impl SearchIndex {
     /// Get statistics about the index
     pub fn stats(&self) -> IndexStats {
         let doc_types: HashMap<DocType, usize> =
-            self.documents.iter().fold(HashMap::new(), |mut acc, doc| {
-                *acc.entry(doc.doc_type.clone()).or_default() += 1;
-                acc
-            });
+            self.documents
+                .iter()
+                .flatten()
+                .fold(HashMap::new(), |mut acc, doc| {
+                    *acc.entry(doc.doc_type.clone()).or_default() += 1;
+                    acc
+                });
 
         IndexStats {
-            total_documents: self.documents.len(),
+            total_documents: self.live_documents.len(),
             total_terms: self.inverted_index.len(),
             avg_doc_length: self.avg_doc_len,
             doc_types,
@@ -371,6 +404,7 @@ impl SearchIndex {
     /// Clear the index
     pub fn clear(&mut self) {
         self.documents.clear();
+        self.live_documents.clear();
         self.inverted_index.clear();
         self.doc_freq.clear();
         self.total_tokens = 0;
@@ -386,7 +420,7 @@ impl SearchIndex {
     pub fn without_repo(&self, repo: &str) -> SearchIndex {
         let mut rebuilt = SearchIndex::new();
         rebuilt.params = self.params.clone();
-        for doc in &self.documents {
+        for doc in self.documents.iter().flatten() {
             if doc.repo != repo {
                 rebuilt.add_document(doc.clone());
             }
@@ -400,12 +434,21 @@ impl SearchIndex {
     pub fn heap_bytes(&self) -> usize {
         use crate::metrics::hashmap_table_bytes;
 
-        let documents = self.documents.capacity() * std::mem::size_of::<SearchDocument>()
+        let documents = self.documents.capacity() * std::mem::size_of::<Option<SearchDocument>>()
             + self
                 .documents
                 .iter()
+                .flatten()
                 .map(SearchDocument::heap_bytes)
                 .sum::<usize>();
+
+        let live_documents =
+            hashmap_table_bytes::<(String, String), usize>(self.live_documents.capacity())
+                + self
+                    .live_documents
+                    .keys()
+                    .map(|(repo, id)| repo.capacity() + id.capacity())
+                    .sum::<usize>();
 
         let inverted_index =
             hashmap_table_bytes::<String, Vec<usize>>(self.inverted_index.capacity())
@@ -431,7 +474,7 @@ impl SearchIndex {
                 })
                 .sum::<usize>();
 
-        documents + inverted_index + doc_freq + synonyms
+        documents + live_documents + inverted_index + doc_freq + synonyms
     }
 }
 
@@ -751,6 +794,21 @@ mod tests {
             after.total_terms,
             before.total_terms
         );
+    }
+
+    #[test]
+    fn reindexing_a_file_replaces_its_document() {
+        let mut index = SearchIndex::new();
+        index.index_file("test", "xyz.rs", "fn xyzgone() { xyzkept }");
+        index.index_file("test", "xyz.rs", "fn xyzfresh() { xyzkept }");
+
+        assert!(
+            index.search("xyzgone", 10).is_empty(),
+            "text the re-index removed must not match"
+        );
+        let hits = index.search("xyzkept", 10);
+        assert_eq!(hits.len(), 1, "the file must appear once");
+        assert_eq!(index.stats().total_documents, 1);
     }
 
     #[test]
