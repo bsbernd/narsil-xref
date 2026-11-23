@@ -15,7 +15,7 @@ use std::process::Command;
 /// cap applies -- large enough to end the MCP connection. 500 commits is
 /// far past what a "recent changes" or "hotspots" query needs; both
 /// render-side caps already stop at 20.
-const MAX_LOG_COMMITS: &str = "500";
+pub const MAX_LOG_COMMITS: usize = 500;
 
 /// Git blame information for a line
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1335,7 +1335,7 @@ mod tests {
         std::fs::write(p.join("a.txt"), "0").unwrap();
         run_git(p, &["add", "a.txt"]);
         run_git(p, &["commit", "-q", "-m", "step"]);
-        let max_commits: usize = MAX_LOG_COMMITS.parse().unwrap();
+        let max_commits = MAX_LOG_COMMITS;
         for step in 1..(max_commits + 1) {
             std::fs::write(p.join("a.txt"), step.to_string()).unwrap();
             run_git(p, &["commit", "-qa", "-m", "step"]);

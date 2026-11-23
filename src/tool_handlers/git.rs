@@ -65,7 +65,8 @@ impl ToolHandler for GetRecentChangesHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let days = args.get_u64_or("days", 7) as u32;
-        engine.get_recent_changes(repo, days).await
+        let window = super::list_window(&args, DEFAULT_BRANCH_INFO_LIMIT);
+        engine.get_recent_changes(repo, days, window).await
     }
 }
 

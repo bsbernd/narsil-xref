@@ -743,7 +743,9 @@ lazy_static! {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string"},
-                    "days": {"type": "integer", "description": "Number of days to look back (default: 7)"}
+                    "days": {"type": "integer", "description": "Number of days to look back (default: 7)"},
+                    "limit": {"type": "integer", "description": "Max commits to list (default: 20; 0 = all). At most 500 commits are read, so a count of 500 may be a lower bound"},
+                    "offset": {"type": "integer", "description": "Index of the first commit to list (default: 0)"}
                 },
                 "required": ["repo"]
             }),
