@@ -377,7 +377,9 @@ pub struct IndexStore {
     index_dir: PathBuf,
     /// Open redb handles per repo DB file. These are file handles, not the
     /// index data — record bytes stay on disk and are read on demand.
-    dbs: DashMap<PathBuf, Arc<Database>>,
+    /// A failed open keeps its error: a retry per changed file of a large
+    /// repo costs one Database::create each.
+    dbs: DashMap<PathBuf, std::result::Result<Arc<Database>, String>>,
 }
 
 impl IndexStore {
@@ -467,32 +469,32 @@ impl IndexStore {
         }
     }
 
-    /// Open-or-return the cached redb handle for a repo.
+    /// Open-or-return the cached redb handle for a repo, or the error of its
+    /// first failed open, which is not retried.
     fn db(&self, repo_root: &Path) -> Result<Arc<Database>> {
         use dashmap::mapref::entry::Entry;
         let path = self.db_path(repo_root);
-        match self.dbs.entry(path.clone()) {
-            Entry::Occupied(e) => Ok(Arc::clone(e.get())),
+        let opened = match self.dbs.entry(path.clone()) {
+            Entry::Occupied(e) => e.get().clone(),
             Entry::Vacant(e) => {
-                let db = match Database::create(&path) {
-                    Ok(db) => Arc::new(db),
-                    Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
-                        return Err(anyhow::anyhow!(
-                            "redb store {} is locked by {}. Two instances cannot persist \
-                             the same repository; this one keeps its index in memory.",
-                            path.display(),
-                            Self::holder(repo_root)
-                        ))
-                    }
-                    Err(e) => {
-                        return Err(anyhow::Error::new(e)
-                            .context(format!("Failed to open redb store {:?}", path)))
-                    }
+                let opened = match Database::create(&path) {
+                    Ok(db) => Ok(Arc::new(db)),
+                    Err(redb::DatabaseError::DatabaseAlreadyOpen) => Err(format!(
+                        "redb store {} is locked by {}. Two instances cannot persist \
+                         the same repository; this one keeps its index in memory.",
+                        path.display(),
+                        Self::holder(repo_root)
+                    )),
+                    Err(e) => Err(format!("Failed to open redb store {:?}: {:#}", path, e)),
                 };
-                e.insert(Arc::clone(&db));
-                Ok(db)
+                if let Err(message) = &opened {
+                    warn!("{message} (not opened again until restart)");
+                }
+                e.insert(opened.clone());
+                opened
             }
-        }
+        };
+        opened.map_err(|message| anyhow::anyhow!(message))
     }
 
     /// Load or create index for a repository.
@@ -1849,6 +1851,27 @@ mod tests {
             .edge
             .confirmed_by
             .contains(crate::symbols::SourceSet::CCLS));
+    }
+
+    /// A failed open is not retried: a watch batch in a large repo would call
+    /// Database::create again for every changed file.
+    #[test]
+    fn a_store_that_failed_to_open_is_not_opened_again() {
+        let dir = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+        let store = IndexStore::new(dir.path().to_path_buf()).unwrap();
+
+        // A directory in place of the store file makes Database::create fail.
+        let db_path = store.db_path(&root);
+        std::fs::create_dir(&db_path).unwrap();
+        assert!(store.db(&root).is_err());
+
+        std::fs::remove_dir(&db_path).unwrap();
+        assert!(
+            store.db(&root).is_err(),
+            "the second call opened the store again"
+        );
     }
 
     /// A store another instance holds must say so, and say who holds it —
