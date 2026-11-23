@@ -6608,17 +6608,23 @@ impl CodeIntelEngine {
         repo: &str,
         base: &str,
         branch: &str,
+        paths: &[String],
         include_body: bool,
         window: response_budget::ListWindow,
     ) -> Result<String> {
         let repo_key = self.resolve_repo(repo)?;
+        // A path the range deleted is gone from the working tree, so check
+        // containment only.
+        for path in paths {
+            validate_pathspec(path)?;
+        }
         let git_repo = self.git_repos.get(&repo_key).ok_or_else(|| {
             anyhow!(
                 "Git not available for {}. Enable with --git flag.",
                 repo_key
             )
         })?;
-        let range = git_repo.commit_range(base, branch, include_body, window)?;
+        let range = git_repo.commit_range(base, branch, paths, include_body, window)?;
         let mut output = format!(
             "# Commits in `{base}..{branch}`\n\nMerge base: `{}`\n\nFound {} commits (oldest first)\n\n",
             range.merge_base, range.total

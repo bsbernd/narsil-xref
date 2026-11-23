@@ -439,11 +439,15 @@ impl GitRepo {
         &self,
         base: &str,
         branch: &str,
+        paths: &[String],
         include_body: bool,
         window: crate::response_budget::ListWindow,
     ) -> Result<CommitRange> {
         Self::validate_input(base, "base")?;
         Self::validate_input(branch, "branch")?;
+        for path in paths {
+            Self::validate_input(path, "path")?;
+        }
         let base = self.git_output(&[
             "rev-parse",
             "--verify",
@@ -460,8 +464,10 @@ impl GitRepo {
         let branch = branch.trim();
         let merge_base = self.git_output(&["merge-base", base, branch])?;
         let range = format!("{base}..{branch}");
+        let mut count_args = vec!["rev-list", "--count", &range, "--"];
+        count_args.extend(paths.iter().map(String::as_str));
         let total: usize = self
-            .git_output(&["rev-list", "--count", &range, "--"])?
+            .git_output(&count_args)?
             .trim()
             .parse()
             .context("Invalid git commit count")?;
@@ -488,17 +494,21 @@ impl GitRepo {
         } else {
             "--format=%H%x00%h%x00%an%x00%ae%x00%at%x00%s%x00"
         };
-        let output = self.git_output(&[
+        let skip = format!("--skip={skip}");
+        let max_count = format!("--max-count={count}");
+        let mut log_args = vec![
             "log",
             "--topo-order",
             "--reverse",
             "-z",
             format,
-            &format!("--skip={skip}"),
-            &format!("--max-count={count}"),
+            &skip,
+            &max_count,
             &range,
             "--",
-        ])?;
+        ];
+        log_args.extend(paths.iter().map(String::as_str));
+        let output = self.git_output(&log_args)?;
         let fields: Vec<&str> = output.split_terminator('\0').collect();
         let (records, remainder) = fields.as_chunks::<7>();
         for record in records {
@@ -1170,7 +1180,7 @@ mod tests {
         );
         let git = GitRepo::new(path).unwrap();
         let first = git
-            .commit_range("base", "topic", true, ListWindow::new(0, 2))
+            .commit_range("base", "topic", &[], true, ListWindow::new(0, 2))
             .unwrap();
         assert_eq!(first.total, 3);
         assert_eq!(
@@ -1185,35 +1195,35 @@ mod tests {
         assert_eq!(first.commits[1].subject, "second");
 
         let last = git
-            .commit_range("base", "topic", false, ListWindow::new(2, 2))
+            .commit_range("base", "topic", &[], false, ListWindow::new(2, 2))
             .unwrap();
         assert_eq!(last.total, 3);
         assert_eq!(last.commits.len(), 1);
         assert_eq!(last.commits[0].subject, "third");
         let all = git
-            .commit_range("base", "topic", false, ListWindow::new(0, 0))
+            .commit_range("base", "topic", &[], false, ListWindow::new(0, 0))
             .unwrap();
         assert_eq!(all.commits.len(), 3);
         assert!(all.commits.iter().all(|commit| commit.body.is_empty()));
         assert_eq!(all.commits[0].hash, first.commits[0].hash);
         assert_eq!(all.commits[2].hash, last.commits[0].hash);
         assert!(git
-            .commit_range("base", "topic", false, ListWindow::new(99, 2))
+            .commit_range("base", "topic", &[], false, ListWindow::new(99, 2))
             .unwrap()
             .commits
             .is_empty());
         let empty = git
-            .commit_range("topic", "topic", false, ListWindow::new(0, 2))
+            .commit_range("topic", "topic", &[], false, ListWindow::new(0, 2))
             .unwrap();
         assert_eq!(empty.total, 0);
         assert!(empty.commits.is_empty());
         for base in ["missing", "--all"] {
             assert!(git
-                .commit_range(base, "topic", false, ListWindow::new(0, 2))
+                .commit_range(base, "topic", &[], false, ListWindow::new(0, 2))
                 .is_err());
         }
         assert!(git
-            .commit_range("base", "missing", false, ListWindow::new(0, 2))
+            .commit_range("base", "missing", &[], false, ListWindow::new(0, 2))
             .is_err());
 
         let index = TempDir::new().unwrap();
@@ -1233,6 +1243,7 @@ mod tests {
                 path.to_str().unwrap(),
                 "base",
                 "topic",
+                &[],
                 true,
                 ListWindow::new(0, 2),
             )
@@ -1254,14 +1265,79 @@ mod tests {
             &["merge", "-q", "--no-ff", "-m", "merge side", "side"],
         );
         let merged = git
-            .commit_range("base", "topic", false, ListWindow::new(0, 0))
+            .commit_range("base", "topic", &[], false, ListWindow::new(0, 0))
             .unwrap();
         assert_eq!(merged.total, 5);
         for (offset, expected) in merged.commits.iter().enumerate() {
             let page = git
-                .commit_range("base", "topic", false, ListWindow::new(offset, 1))
+                .commit_range("base", "topic", &[], false, ListWindow::new(offset, 1))
                 .unwrap();
             assert_eq!(page.commits[0].hash, expected.hash);
+        }
+    }
+
+    /// The count, the page and the listing all honour the pathspec, and a path
+    /// the range deleted still matches.
+    #[tokio::test]
+    async fn commit_range_lists_only_commits_touching_paths() {
+        use crate::response_budget::ListWindow;
+
+        let directory = TempDir::new().unwrap();
+        let path = directory.path();
+        run_git(path, &["init", "-q", "-b", "base"]);
+        run_git(path, &["commit", "-q", "--allow-empty", "-m", "root"]);
+        run_git(path, &["checkout", "-q", "-b", "topic"]);
+        std::fs::create_dir(path.join("xyz_dir")).unwrap();
+        for (file, subject) in [
+            ("xyz_dir/xyz_a.c", "add xyz_a"),
+            ("xyz_b.c", "add xyz_b"),
+            ("xyz_dir/xyz_gone.c", "add xyz_gone"),
+        ] {
+            std::fs::write(path.join(file), subject).unwrap();
+            run_git(path, &["add", file]);
+            run_git(path, &["commit", "-q", "-m", subject]);
+        }
+        run_git(path, &["rm", "-q", "xyz_dir/xyz_gone.c"]);
+        run_git(path, &["commit", "-q", "-m", "remove xyz_gone"]);
+        let git = GitRepo::new(path).unwrap();
+        let subjects = |paths: &[String], window| -> (usize, Vec<String>) {
+            let range = git
+                .commit_range("base", "topic", paths, false, window)
+                .unwrap();
+            let listed = range.commits.into_iter().map(|commit| commit.subject);
+            (range.total, listed.collect())
+        };
+
+        let directory_paths = vec!["xyz_dir".to_string()];
+        assert_eq!(
+            subjects(&directory_paths, ListWindow::new(1, 1)),
+            (3, vec!["add xyz_gone".to_string()])
+        );
+        let file_paths = vec!["xyz_b.c".to_string(), "xyz_dir/xyz_gone.c".to_string()];
+        assert_eq!(
+            subjects(&file_paths, ListWindow::new(0, 0)).1,
+            ["add xyz_b", "add xyz_gone", "remove xyz_gone"]
+        );
+
+        let index = TempDir::new().unwrap();
+        let engine = crate::index::CodeIntelEngine::with_options(
+            index.path().to_path_buf(),
+            vec![path.to_path_buf()],
+            crate::index::EngineOptions {
+                git_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        engine.complete_initialization().await.unwrap();
+        let repo = path.to_str().unwrap();
+        for outside in ["../xyz_b.c", "/etc"] {
+            let paths = vec![outside.to_string()];
+            assert!(engine
+                .get_commit_range(repo, "base", "topic", &paths, false, ListWindow::new(0, 0))
+                .await
+                .is_err());
         }
     }
 

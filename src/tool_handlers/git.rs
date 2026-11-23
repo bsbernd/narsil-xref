@@ -82,10 +82,16 @@ impl ToolHandler for GetCommitRangeHandler {
         let repo = args.get_str("repo").unwrap_or("");
         let base = super::require_arg(&args, "base", "get_commit_range")?;
         let branch = args.get_str("branch").unwrap_or("HEAD");
+        let paths: Vec<String> = args
+            .get_array("paths")
+            .into_iter()
+            .flatten()
+            .filter_map(|path| path.as_str().map(str::to_string))
+            .collect();
         let include_body = args.get_bool_or("include_body", false);
         let window = super::list_window(&args, crate::response_budget::DEFAULT_LIST_LIMIT as u64);
         engine
-            .get_commit_range(repo, base, branch, include_body, window)
+            .get_commit_range(repo, base, branch, &paths, include_body, window)
             .await
     }
 }
