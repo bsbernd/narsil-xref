@@ -197,6 +197,7 @@ impl GtagsManager {
             return false;
         }
         info!("gtags: building GTAGS database in {:?}", db_dir);
+        let build_start = std::time::Instant::now();
         // `gtags` (the builder) does not consult GTAGSDBPATH — that is a
         // `global`/query-side variable — so the output directory has to be
         // its positional dbpath argument instead.
@@ -211,6 +212,12 @@ impl GtagsManager {
                 false
             }
             Ok(out) => {
+                info!(
+                    "gtags: building GTAGS database in {:?} finished in {:.1} s ({})",
+                    db_dir,
+                    build_start.elapsed().as_secs_f64(),
+                    out.status
+                );
                 if !out.status.success() {
                     warn!(
                         "gtags: build failed in {:?}: {}",
@@ -241,6 +248,7 @@ impl GtagsManager {
             "gtags: refreshing GTAGS database in {:?} (global -u)",
             db_dir
         );
+        let update_start = std::time::Instant::now();
         let updated = match tokio::process::Command::new("global")
             .arg("-u")
             .current_dir(repo_path)
@@ -254,6 +262,12 @@ impl GtagsManager {
                 false
             }
             Ok(out) => {
+                info!(
+                    "gtags: global -u in {:?} finished in {:.1} s ({})",
+                    repo_path,
+                    update_start.elapsed().as_secs_f64(),
+                    out.status
+                );
                 if !out.status.success() {
                     warn!(
                         "gtags: global -u failed in {:?}: {}",

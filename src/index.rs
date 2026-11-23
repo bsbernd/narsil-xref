@@ -5179,7 +5179,7 @@ impl CodeIntelEngine {
             // not abort saving the remaining repos.
             match store.save_full(&persisted) {
                 Ok(()) => saved_count += 1,
-                Err(e) => warn!("Failed to save index for {}: {}", repo_name, e),
+                Err(e) => warn!("Failed to save index for {}: {:#}", repo_name, e),
             }
         }
 
@@ -5566,7 +5566,7 @@ impl CodeIntelEngine {
                     store.apply_file_changes(&PathBuf::from(&repo_name), &upserts, &deletes)
                 {
                     warn!(
-                        "Failed to persist compile_commands delta for {}: {}",
+                        "Failed to persist compile_commands delta for {}: {:#}",
                         repo_name, e
                     );
                 }
@@ -5592,6 +5592,7 @@ impl CodeIntelEngine {
         changes: &[crate::persist::FileChange],
     ) -> Result<usize> {
         use crate::persist::{ChangeType, FileMetadata};
+        let batch_start = std::time::Instant::now();
 
         // Per-repo batches so each repo's redb store is updated in one write
         // transaction, touching only changed records — never the whole repo.
@@ -5888,6 +5889,8 @@ impl CodeIntelEngine {
             }
         }
 
+        let file_loop_time = batch_start.elapsed();
+
         // Persist only the repos that changed, each in a single redb write
         // transaction. Untouched repos (e.g. the kernel tree) are never opened.
         if self.options.persist_enabled {
@@ -5898,7 +5901,7 @@ impl CodeIntelEngine {
                         &repo_pending.upserts,
                         &repo_pending.deletes,
                     ) {
-                        warn!("Failed to persist index changes for {}: {}", repo_name, e);
+                        warn!("Failed to persist index changes for {}: {:#}", repo_name, e);
                     }
                 }
             }
@@ -5908,6 +5911,7 @@ impl CodeIntelEngine {
         // changed — once per repo, since the watcher already debounces/batches.
         // Only pay for a full-tree `global -u` when the DB is actually behind the
         // changed sources (or one was deleted); the refresh itself is debounced.
+        let gtags_update_start = std::time::Instant::now();
         for (repo_path, changed) in &gtags_dirty {
             let any_deleted = changed.iter().any(|p| !p.exists());
             if any_deleted || gtags_database_stale(repo_path, changed) {
@@ -5921,9 +5925,13 @@ impl CodeIntelEngine {
             }
         }
 
+        let gtags_update_time = gtags_update_start.elapsed();
+
         // Augment changed C/C++ file symbols from gtags, now that global -u has
         // run and the GTAGS database reflects the current sources. Mirrors
         // index_repo phase 3 for the incremental path.
+        let gtags_list_start = std::time::Instant::now();
+        let mut gtags_listed_files = 0;
         if let Some(gtags) = &self.gtags_manager {
             for (repo_path, changed) in &gtags_dirty {
                 if !self.gtags_repo_enabled(repo_path) {
@@ -5942,6 +5950,7 @@ impl CodeIntelEngine {
                         .unwrap_or(abs_path)
                         .to_string_lossy()
                         .to_string();
+                    gtags_listed_files += 1;
                     let gtags_syms: Vec<Symbol> = gtags
                         .list_file_symbols(abs_path, repo_path)
                         .await
@@ -5978,11 +5987,25 @@ impl CodeIntelEngine {
             }
         }
 
+        let gtags_list_time = gtags_list_start.elapsed();
+
         // Re-measure only when something was actually re-indexed (a lone
         // compile_commands.json restart that touches no sources leaves count 0).
         if count > 0 {
             self.refresh_memory_snapshot();
         }
+
+        info!(
+            "watch batch: {} changes in {} applied in {:.1} s (file loop {:.1} s, \
+             global -u {:.1} s, global -f {:.1} s over {} files)",
+            changes.len(),
+            self.repos_for_changes(changes).join(", "),
+            batch_start.elapsed().as_secs_f64(),
+            file_loop_time.as_secs_f64(),
+            gtags_update_time.as_secs_f64(),
+            gtags_list_time.as_secs_f64(),
+            gtags_listed_files
+        );
 
         Ok(count)
     }
@@ -9224,7 +9247,7 @@ async fn build_definition_map(
         Ok(writer) => writer,
         Err(e) => {
             warn!(
-                "definition map: cannot start build for {}: {}",
+                "definition map: cannot start build for {}: {:#}",
                 repo_name, e
             );
             return false;
