@@ -37,8 +37,15 @@ impl ToolHandler for GetProjectStructureHandler {
         let max_depth = args.get_u64_or("max_depth", 4) as usize;
         let max_entries_per_dir = args.get_u64_or("max_entries_per_dir", 40) as usize;
         let max_total_entries = args.get_u64_or("max_total_entries", 600) as usize;
+        let file_pattern = args.get_str("file_pattern");
         engine
-            .get_project_structure(repo, max_depth, max_entries_per_dir, max_total_entries)
+            .get_project_structure(
+                repo,
+                max_depth,
+                max_entries_per_dir,
+                max_total_entries,
+                file_pattern,
+            )
             .await
     }
 }
