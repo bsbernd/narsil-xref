@@ -64,7 +64,7 @@ async fn regex_mode_matches_an_alternation_text_mode_cannot() -> Result<()> {
     let alternation = "QUEUE_DEPTH_DEF|QUEUE_DEPTH_MAX|URING_ENTRIES_MAX";
 
     let text = engine
-        .search_code(Some(&repo_arg), alternation, None, 60, None, None)
+        .search_code(Some(&repo_arg), alternation, None, 60, None, None, None)
         .await?;
     assert!(
         text.contains("Found 0 results"),
@@ -72,7 +72,15 @@ async fn regex_mode_matches_an_alternation_text_mode_cannot() -> Result<()> {
     );
 
     let regex = engine
-        .search_code(Some(&repo_arg), alternation, None, 60, None, Some("regex"))
+        .search_code(
+            Some(&repo_arg),
+            alternation,
+            None,
+            60,
+            None,
+            Some("regex"),
+            None,
+        )
         .await?;
     assert!(
         regex.contains("nio_uring.h") && regex.contains("nio_uring.c"),
@@ -87,6 +95,7 @@ async fn regex_mode_matches_an_alternation_text_mode_cannot() -> Result<()> {
             60,
             None,
             Some("regex"),
+            None,
         )
         .await;
     assert!(
@@ -95,7 +104,7 @@ async fn regex_mode_matches_an_alternation_text_mode_cannot() -> Result<()> {
     );
 
     let unknown_mode = engine
-        .search_code(Some(&repo_arg), "depth", None, 60, None, Some("glob"))
+        .search_code(Some(&repo_arg), "depth", None, 60, None, Some("glob"), None)
         .await;
     assert!(unknown_mode.is_err(), "an unknown mode must be refused");
     Ok(())
@@ -120,6 +129,7 @@ async fn test_search_code_multi_token_non_adjacent() -> Result<()> {
             "struct tool_config",
             None,
             10,
+            None,
             None,
             None,
         )
@@ -165,6 +175,7 @@ async fn test_search_code_fallback_prefers_code_over_comments() -> Result<()> {
             10,
             None,
             None,
+            None,
         )
         .await?;
 
@@ -200,6 +211,7 @@ async fn test_search_code_phrase_on_one_line_no_fallback() -> Result<()> {
             10,
             None,
             None,
+            None,
         )
         .await?;
 
@@ -224,7 +236,7 @@ async fn test_search_code_labels_repo_across_repos() -> Result<()> {
 
     // repo=None searches all indexed repos.
     let out = engine
-        .search_code(None, "widget", None, 10, None, None)
+        .search_code(None, "widget", None, 10, None, None, None)
         .await?;
 
     assert!(
@@ -253,6 +265,7 @@ async fn test_search_code_no_repo_label_single_repo() -> Result<()> {
             "widget",
             None,
             10,
+            None,
             None,
             None,
         )
