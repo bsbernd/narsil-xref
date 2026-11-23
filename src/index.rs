@@ -3798,9 +3798,13 @@ impl CodeIntelEngine {
         max_depth: usize,
         max_entries_per_dir: usize,
         max_total_entries: usize,
+        file_pattern: Option<&str>,
     ) -> Result<String> {
         let repo_key = self.resolve_repo(repo)?;
         let path = PathBuf::from(&repo_key);
+        if let Some(pattern) = file_pattern {
+            return self.list_indexed_files(&path, pattern, max_total_entries);
+        }
         let mut output = String::new();
         output.push_str(&format!("# Project Structure: {}\n\n```\n", repo_key));
 
@@ -3818,6 +3822,54 @@ impl CodeIntelEngine {
                 "\n*Tree truncated at {} entries. Raise `max_total_entries` / \
                  `max_entries_per_dir`, or lower `max_depth` for a wider overview.*\n",
                 max_total_entries
+            ));
+        }
+        Ok(output)
+    }
+
+    /// The indexed files of the repo at `repo_path` whose repo-relative path
+    /// matches the glob `pattern`, with their sizes, in path order. Lets a
+    /// caller find a file by name without walking the directory tree.
+    fn list_indexed_files(
+        &self,
+        repo_path: &Path,
+        pattern: &str,
+        max_entries: usize,
+    ) -> Result<String> {
+        let glob = compile_file_pattern(pattern)?;
+
+        let mut matches: Vec<(String, usize)> = Vec::new();
+        for entry in self.file_cache.iter() {
+            let Ok(rel_path) = entry.key().strip_prefix(repo_path) else {
+                continue;
+            };
+            let rel_path = rel_path.to_string_lossy();
+            if glob.matches(&rel_path) {
+                matches.push((rel_path.into_owned(), entry.value().len()));
+            }
+        }
+        matches.sort();
+
+        let shown = if max_entries == 0 {
+            matches.len()
+        } else {
+            matches.len().min(max_entries)
+        };
+        let mut output = format!(
+            "# Indexed files matching `{}` in {}\n\nFound {} files\n\n",
+            pattern,
+            repo_path.display(),
+            matches.len()
+        );
+        for (rel_path, size) in &matches[..shown] {
+            output.push_str(&format!("- `{}` ({} bytes)\n", rel_path, size));
+        }
+        if shown < matches.len() {
+            output.push_str(&format!(
+                "\n*Showing {} of {}. Raise `max_total_entries` (0 = all) or narrow \
+                 `file_pattern`.*\n",
+                shown,
+                matches.len()
             ));
         }
         Ok(output)
@@ -10923,6 +10975,63 @@ mod tests {
             .await
             .unwrap();
         assert!(paged.contains("Showing 1 of"), "output: {paged}");
+    }
+
+    /// `file_pattern` makes get_project_structure list the indexed files
+    /// whose path matches, instead of the directory tree.
+    #[tokio::test]
+    async fn get_project_structure_with_file_pattern_lists_matching_files() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        write_file(&repo.join("src/xyz_one.c"), "int xyz_one;\n");
+        write_file(&repo.join("src/deep/xyz_two.c"), "int xyz_two;\n");
+        write_file(&repo.join("src/xyz_three.h"), "int xyz_three;\n");
+        write_file(&repo.join("other/xyz_four.c"), "int xyz_four;\n");
+
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![repo.clone()])
+            .await
+            .unwrap();
+        engine.reindex_all().await.unwrap();
+        let repo_arg = repo.to_str().unwrap();
+
+        let listed = engine
+            .get_project_structure(repo_arg, 4, 40, 600, Some("src/*.c"))
+            .await
+            .unwrap();
+        assert!(listed.contains("Found 2 files"), "listing: {listed}");
+        assert!(
+            listed.contains("- `src/xyz_one.c` (13 bytes)"),
+            "listing: {listed}"
+        );
+        assert!(
+            listed.contains("- `src/deep/xyz_two.c`"),
+            "listing: {listed}"
+        );
+        assert!(!listed.contains("xyz_three") && !listed.contains("xyz_four"));
+
+        let braced = engine
+            .get_project_structure(repo_arg, 4, 40, 600, Some("src/*.{c,h}"))
+            .await
+            .unwrap();
+        assert!(braced.contains("Found 3 files"), "listing: {braced}");
+
+        let capped = engine
+            .get_project_structure(repo_arg, 4, 40, 1, Some("*.c"))
+            .await
+            .unwrap();
+        assert!(capped.contains("Found 3 files"), "listing: {capped}");
+        assert!(capped.contains("Showing 1 of 3"), "listing: {capped}");
+
+        let bad = engine
+            .get_project_structure(repo_arg, 4, 40, 600, Some("[unclosed"))
+            .await;
+        assert!(bad.is_err());
+
+        let tree = engine
+            .get_project_structure(repo_arg, 4, 40, 600, None)
+            .await
+            .unwrap();
+        assert!(tree.contains("Project Structure"), "tree: {tree}");
     }
 
     /// gtags answers with every use of a name. These are the ones that made
