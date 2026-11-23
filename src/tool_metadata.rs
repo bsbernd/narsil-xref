@@ -495,7 +495,8 @@ lazy_static! {
                     "file_pattern": {"type": "string", "description": "Glob pattern to filter files"},
                     "max_results": {"type": "integer", "description": "Maximum results to return (default: 10)"},
                     "mode": {"type": "string", "enum": ["text", "regex"], "description": "text (default): case-insensitive terms. regex: Rust regex per line, case-sensitive unless the pattern says otherwise"},
-                    "exclude_tests": {"type": "boolean", "description": "Skip test files (default: false)"}
+                    "exclude_tests": {"type": "boolean", "description": "Skip test files (default: false)"},
+                    "revision": {"type": "string", "description": "Search the tree of this commit, tag or branch (read through git grep) instead of the working tree. Requires --git flag. Not cached"}
                 },
                 "required": ["query"]
             }),

@@ -4371,6 +4371,7 @@ impl CodeIntelEngine {
         Ok(output)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn search_code(
         &self,
         repo: Option<&str>,
@@ -4379,6 +4380,7 @@ impl CodeIntelEngine {
         max_results: usize,
         exclude_tests: Option<bool>,
         mode: Option<&str>,
+        revision: Option<&str>,
     ) -> Result<String> {
         use crate::extract::is_test_file;
 
@@ -4412,8 +4414,13 @@ impl CodeIntelEngine {
             QueryCacheKey::code_search_with_options(repo, query, &options)
         };
 
+        // A search of a revision is neither read from nor written to the cache:
+        // the cache is invalidated by changes to working-tree files, and a name
+        // such as HEAD stands for a different tree after the next commit.
+        let use_cache = self.options.cache_enabled && revision.is_none();
+
         // Check cache first
-        if self.options.cache_enabled {
+        if use_cache {
             if let Some(cached) = self.query_cache.get(&cache_key) {
                 return Ok(cached);
             }
@@ -4484,21 +4491,63 @@ impl CodeIntelEngine {
                 }
             };
 
-        // Pass 1: lines containing the whole phrase, or (for a multi-word
-        // query) every token in any order.
-        for repo_name in &repos_to_search {
+        // With a revision, the files of that tree that hold the query, read
+        // through git; the working-tree file cache is not consulted.
+        let mut revision_files: Vec<(String, String, String)> = Vec::new();
+        if let Some(rev) = revision {
+            let terms: Vec<&str> = if pattern.is_some() {
+                vec![query]
+            } else if tokens.is_empty() {
+                vec![query_lower.as_str()]
+            } else {
+                tokens.iter().map(String::as_str).collect()
+            };
+            for repo_name in &repos_to_search {
+                let git_repo = self.git_repos.get(repo_name).ok_or_else(|| {
+                    anyhow!(
+                        "Git not available for {}. Enable with --git flag.",
+                        repo_name
+                    )
+                })?;
+                let repo_path = PathBuf::from(repo_name);
+                for rel_path in
+                    git_repo.files_matching_at_revision(rev, &terms, pattern.is_some())?
+                {
+                    if file_in_scope(&repo_path.join(&rel_path), &repo_path).is_none() {
+                        continue;
+                    }
+                    let content = git_repo.blob_at_revision(rev, &rel_path)?;
+                    revision_files.push((repo_name.clone(), rel_path, content));
+                }
+            }
+        }
+
+        // Calls `visit` with the repo-relative path and the content of every
+        // file of `repo_name` that is in scope.
+        let for_each_file = |repo_name: &str, visit: &mut dyn FnMut(&str, &str)| {
+            if revision.is_some() {
+                for (file_repo, rel_path, content) in &revision_files {
+                    if file_repo == repo_name {
+                        visit(rel_path, content);
+                    }
+                }
+                return;
+            }
             // After resolve_repo / iteration of self.repos, repo_name is the
             // canonical absolute path used as both the engine's map key and
             // the on-disk repository root.
             let repo_path = PathBuf::from(repo_name);
-
             for entry in self.file_cache.iter() {
-                let file_path = entry.key();
-                let Some(rel_path) = file_in_scope(file_path, &repo_path) else {
-                    continue;
-                };
+                if let Some(rel_path) = file_in_scope(entry.key(), &repo_path) {
+                    visit(&rel_path, entry.value());
+                }
+            }
+        };
 
-                let content = entry.value();
+        // Pass 1: lines containing the whole phrase, or (for a multi-word
+        // query) every token in any order.
+        for repo_name in &repos_to_search {
+            for_each_file(repo_name, &mut |rel_path, content| {
                 let lines: Vec<&str> = content.lines().collect();
 
                 for (line_num, line) in lines.iter().enumerate() {
@@ -4517,11 +4566,11 @@ impl CodeIntelEngine {
                     if let Some(score) = score {
                         results.push((
                             repo_name.clone(),
-                            make_excerpt(&lines, line_num, &rel_path, score),
+                            make_excerpt(&lines, line_num, rel_path, score),
                         ));
                     }
                 }
-            }
+            });
         }
 
         // Pass 2 (fallback): if no single line matched a multi-word query, fall
@@ -4531,18 +4580,10 @@ impl CodeIntelEngine {
         let used_fallback = results.is_empty() && multi_token && pattern.is_none();
         if used_fallback {
             for repo_name in &repos_to_search {
-                let repo_path = PathBuf::from(repo_name);
-
-                for entry in self.file_cache.iter() {
-                    let file_path = entry.key();
-                    let Some(rel_path) = file_in_scope(file_path, &repo_path) else {
-                        continue;
-                    };
-
-                    let content = entry.value();
+                for_each_file(repo_name, &mut |rel_path, content| {
                     let content_lower = content.to_lowercase();
                     if !tokens.iter().all(|t| content_lower.contains(t.as_str())) {
-                        continue;
+                        return;
                     }
 
                     let lines: Vec<&str> = content.lines().collect();
@@ -4554,9 +4595,9 @@ impl CodeIntelEngine {
                     let score = coverage + calculate_relevance(anchor_line, &query_lower);
                     results.push((
                         repo_name.clone(),
-                        make_excerpt(&lines, anchor, &rel_path, score),
+                        make_excerpt(&lines, anchor, rel_path, score),
                     ));
-                }
+                });
             }
         }
 
@@ -4624,7 +4665,7 @@ impl CodeIntelEngine {
         }
 
         // Cache the result with file dependencies for smart invalidation
-        if self.options.cache_enabled {
+        if use_cache {
             self.query_cache
                 .insert_with_files(cache_key, output.clone(), dependent_files);
         }
@@ -11061,6 +11102,140 @@ similarity index 90%
         assert!(bad.is_err());
     }
 
+    /// `revision` makes search_code read the tree of that commit through git,
+    /// so text that a later commit removed is still found.
+    #[tokio::test]
+    async fn search_code_with_revision_searches_the_old_tree() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        write_file(
+            &repo.join("xyz_old.c"),
+            "int Alpha_Marker(void);\nint keep;\n",
+        );
+        write_file(&repo.join("xyz_old.h"), "/* alpha_marker in a header */\n");
+        write_file(
+            &repo.join("xyz_split.c"),
+            "int first_term;\n\nint second_term;\n",
+        );
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-q", "-m", "xyz old"]);
+        run_git(
+            &repo,
+            &["rm", "-q", "xyz_old.c", "xyz_old.h", "xyz_split.c"],
+        );
+        write_file(&repo.join("xyz_new.c"), "int beta_marker(void);\n");
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-q", "-m", "xyz new"]);
+
+        let engine = CodeIntelEngine::with_options(
+            temp.path().join("index"),
+            vec![repo.clone()],
+            EngineOptions {
+                git_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        engine.reindex_all().await.unwrap();
+        let repo_arg = repo.to_str().unwrap();
+
+        let now = engine
+            .search_code(Some(repo_arg), "alpha_marker", None, 10, None, None, None)
+            .await
+            .unwrap();
+        assert!(now.contains("Found 0 results"), "working tree: {now}");
+
+        let old = engine
+            .search_code(
+                Some(repo_arg),
+                "alpha_marker",
+                None,
+                10,
+                None,
+                None,
+                Some("HEAD~1"),
+            )
+            .await
+            .unwrap();
+        assert!(old.contains("Found 2 results"), "old tree: {old}");
+        assert!(old.contains("`xyz_old.c`") && old.contains("Alpha_Marker"));
+
+        let only_header = engine
+            .search_code(
+                Some(repo_arg),
+                "alpha_marker",
+                Some("*.h"),
+                10,
+                None,
+                None,
+                Some("HEAD~1"),
+            )
+            .await
+            .unwrap();
+        assert!(only_header.contains("Found 1 results"), "{only_header}");
+
+        let limited = engine
+            .search_code(
+                Some(repo_arg),
+                "alpha_marker",
+                None,
+                1,
+                None,
+                None,
+                Some("HEAD~1"),
+            )
+            .await
+            .unwrap();
+        assert!(limited.contains("Found 1 results"), "{limited}");
+
+        let regex = engine
+            .search_code(
+                Some(repo_arg),
+                "Alpha_M\\w+\\(void\\)",
+                None,
+                10,
+                None,
+                Some("regex"),
+                Some("HEAD~1"),
+            )
+            .await
+            .unwrap();
+        assert!(regex.contains("Found 1 results"), "regex: {regex}");
+
+        let apart = engine
+            .search_code(
+                Some(repo_arg),
+                "first_term second_term",
+                None,
+                10,
+                None,
+                None,
+                Some("HEAD~1"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            apart.contains("`xyz_split.c`"),
+            "terms on two lines: {apart}"
+        );
+
+        let unknown = engine
+            .search_code(
+                Some(repo_arg),
+                "alpha_marker",
+                None,
+                10,
+                None,
+                None,
+                Some("no-such-rev"),
+            )
+            .await;
+        assert!(unknown.is_err());
+    }
+
     /// A file deleted by a later commit is absent from the working tree, and
     /// its history is still wanted.
     #[tokio::test]
@@ -11427,6 +11602,7 @@ similarity index 90%
                 "--verbose",
                 None,
                 10,
+                None,
                 None,
                 None,
             )
@@ -12995,7 +13171,15 @@ similarity index 90%
             .expect_err("find_symbols answered for every file");
         assert!(err.to_string().contains("glob"), "got: {err}");
         let err = engine
-            .search_code(Some(&repo_key), "widget_fn", Some("[oops"), 10, None, None)
+            .search_code(
+                Some(&repo_key),
+                "widget_fn",
+                Some("[oops"),
+                10,
+                None,
+                None,
+                None,
+            )
             .await
             .expect_err("search_code answered for every file");
         assert!(err.to_string().contains("glob"), "got: {err}");

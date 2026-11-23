@@ -350,6 +350,65 @@ impl GitRepo {
         self.parse_log_output(&String::from_utf8_lossy(&output.stdout))
     }
 
+    /// Paths of the text files in the tree of `revision` that hold the search
+    /// terms: every term as a case-insensitive fixed string, or with `regex`
+    /// the one pattern `terms[0]`. Narrows a search of an old tree to the
+    /// files worth reading.
+    pub fn files_matching_at_revision(
+        &self,
+        revision: &str,
+        terms: &[&str],
+        regex: bool,
+    ) -> Result<Vec<String>> {
+        Self::validate_input(revision, "revision")?;
+
+        let mut args = vec!["grep", "-l", "-z", "-I"];
+        if regex {
+            args.push("-P");
+        } else {
+            args.extend(["-i", "-F", "--all-match"]);
+        }
+        for term in terms {
+            args.push("-e");
+            args.push(term);
+        }
+        args.push(revision);
+        args.push("--");
+
+        let output = Command::new("git")
+            .args(&args)
+            .current_dir(&self.root)
+            .output()
+            .context("Failed to run git grep")?;
+        // git grep exits 1 when nothing matched.
+        if output.status.code() == Some(1) {
+            return Ok(Vec::new());
+        }
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git grep failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+
+        // With a revision, each name comes out as `<revision>:<path>`.
+        let prefix = format!("{}:", revision);
+        let listing = String::from_utf8_lossy(&output.stdout);
+        let mut paths = Vec::new();
+        for name in listing.split('\0') {
+            if let Some(path) = name.strip_prefix(prefix.as_str()) {
+                paths.push(path.to_string());
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Contents of `path` in the tree of `revision`
+    pub fn blob_at_revision(&self, revision: &str, path: &str) -> Result<String> {
+        Self::validate_input(revision, "revision")?;
+        self.git_output(&["show", &format!("{}:{}", revision, path)])
+    }
+
     fn git_output(&self, args: &[&str]) -> Result<String> {
         let output = Command::new("git")
             .args(args)
