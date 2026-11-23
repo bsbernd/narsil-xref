@@ -783,6 +783,86 @@ int xyz_reply(int error)
 }
 
 #[test]
+fn test_c_else_branch_calls_stay_beside_split_if_function() {
+    let parser = LanguageParser::new().unwrap();
+    let call_graph = CallGraph::new();
+
+    let code = r#"
+int xyz_open(int flags)
+{
+#if XYZ_FEATURE
+    return xyz_open_fast(flags);
+#else
+    return xyz_open_slow(flags);
+#endif
+}
+
+#if XYZ_FEATURE
+static int xyz_pipe(int flags)
+{
+    return xyz_pipe_fast(flags);
+}
+#else
+static int xyz_pipe(int flags)
+{
+    return xyz_pipe_slow(flags);
+}
+#endif
+
+int xyz_reply(int error)
+{
+#if XYZ_FEATURE
+    const char *text = xyz_describe(error);
+    if (text == NULL || error > 0) {
+#else
+    if (error <= -1000 || error > 0) {
+#endif
+        error = -1;
+    }
+
+    return xyz_send(error);
+}
+"#;
+
+    let parsed = parser.parse_file(Path::new("reply.c"), code).unwrap();
+    assert!(
+        parsed.symbols.iter().any(|s| s.name == "xyz_reply"),
+        "xyz_reply has no symbol, got: {:?}",
+        parsed.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+
+    let tree = parsed.tree.unwrap();
+    let files = vec![("reply.c".to_string(), code.to_string(), tree)];
+    call_graph.build_from_files(&files).unwrap();
+
+    let callees = |function: &str| -> Vec<String> {
+        call_graph
+            .get_callees(function)
+            .into_iter()
+            .map(|e| e.target)
+            .collect()
+    };
+    let open_callees = callees("xyz_open");
+    assert!(
+        open_callees.iter().any(|t| t.ends_with("xyz_open_slow")),
+        "the #else branch call of xyz_open is lost, got: {:?}",
+        open_callees
+    );
+    let pipe_callees = callees("xyz_pipe");
+    assert!(
+        pipe_callees.iter().any(|t| t.ends_with("xyz_pipe_slow")),
+        "the #else definition of xyz_pipe is lost, got: {:?}",
+        pipe_callees
+    );
+    let reply_callees = callees("xyz_reply");
+    assert!(
+        reply_callees.iter().any(|t| t.ends_with("xyz_send")),
+        "xyz_reply should call xyz_send, got: {:?}",
+        reply_callees
+    );
+}
+
+#[test]
 fn test_c_call_graph_without_parse_errors_has_no_degraded_regions() {
     let parser = LanguageParser::new().unwrap();
     let call_graph = CallGraph::new();
