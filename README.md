@@ -72,6 +72,17 @@ server from its config, for example `.mcp.json` in the project root:
 }
 ```
 
+Claude Code writes the same entry for all projects of the user with:
+
+```bash
+claude mcp add --scope user narsil-xref -- narsil-xref --repos . --git --call-graph --persist --lsp
+```
+
+The client names each tool after the server, for example
+`mcp__narsil-xref__find_symbols`. A setup that moves from narsil-mcp can
+keep the server name `narsil-mcp` and change only `command`: tool names in
+permission lists, hooks and prompts then stay valid.
+
 With the systemd units from `setup.sh --systemd`, one SSE server per
 profile starts on the first connection:
 
