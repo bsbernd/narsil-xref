@@ -560,14 +560,19 @@ impl GitRepo {
         Ok(contributors)
     }
 
-    /// Get the diff for a specific commit
+    /// Get the diff for a specific commit, or with `base` the combined diff
+    /// from `base` to `commit`
     pub fn commit_diff(
         &self,
         commit: &str,
+        base: Option<&str>,
         file_path: Option<&str>,
         context_lines: Option<usize>,
     ) -> Result<String> {
         Self::validate_input(commit, "commit")?;
+        if let Some(base) = base {
+            Self::validate_input(base, "base")?;
+        }
         if let Some(path) = file_path {
             Self::validate_input(path, "file_path")?;
         }
@@ -577,13 +582,20 @@ impl GitRepo {
         // The message carries why the change was made, which no other tool
         // returns; the diff alone sends the caller to `git show` for it.
         let show = |rev: &str| {
-            let mut args = vec![
-                "show",
-                "--format=commit %H%nAuthor: %an <%ae>%nDate:   %ad%n%n%B",
-                "--patch",
-            ];
+            // Between two revisions there is no single message to show.
+            let mut args = match base {
+                Some(_) => vec!["diff", "--patch"],
+                None => vec![
+                    "show",
+                    "--format=commit %H%nAuthor: %an <%ae>%nDate:   %ad%n%n%B",
+                    "--patch",
+                ],
+            };
             if let Some(flag) = &unified {
                 args.push(flag.as_str());
+            }
+            if let Some(base) = base {
+                args.push(base);
             }
             args.push(rev);
             if let Some(path) = file_path {
@@ -1431,7 +1443,7 @@ mod tests {
         run_git(p, &["update-ref", "refs/patches/work/my-patch", "HEAD"]);
 
         let repo = GitRepo::new(p).unwrap();
-        let diff = repo.commit_diff("my-patch", None, None).unwrap();
+        let diff = repo.commit_diff("my-patch", None, None, None).unwrap();
         assert!(diff.contains("a_patched"), "diff was: {}", diff);
     }
 
@@ -1457,7 +1469,7 @@ mod tests {
         );
 
         let repo = GitRepo::new(p).unwrap();
-        let diff = repo.commit_diff("HEAD", None, None).unwrap();
+        let diff = repo.commit_diff("HEAD", None, None, None).unwrap();
         assert!(diff.contains("pause the widget"), "{diff}");
         assert!(diff.contains("The reason this is safe"), "{diff}");
         assert!(diff.contains("a_patched"), "{diff}");
@@ -1478,8 +1490,8 @@ mod tests {
         run_git(p, &["commit", "-qa", "-m", "edit one line"]);
 
         let repo = GitRepo::new(p).unwrap();
-        let wide = repo.commit_diff("HEAD", None, None).unwrap();
-        let tight = repo.commit_diff("HEAD", None, Some(0)).unwrap();
+        let wide = repo.commit_diff("HEAD", None, None, None).unwrap();
+        let tight = repo.commit_diff("HEAD", None, None, Some(0)).unwrap();
         assert!(tight.contains("+int v20_edited;"), "{tight}");
         assert!(!tight.contains(" int v17;"), "context not dropped: {tight}");
         assert!(wide.contains(" int v17;"), "{wide}");
@@ -1496,7 +1508,7 @@ mod tests {
         run_git(p, &["commit", "-q", "-m", "base"]);
 
         let repo = GitRepo::new(p).unwrap();
-        assert!(repo.commit_diff("no-such-patch", None, None).is_err());
+        assert!(repo.commit_diff("no-such-patch", None, None, None).is_err());
     }
 
     /// Without a file the caller gets `git log -S` over the files passed in;

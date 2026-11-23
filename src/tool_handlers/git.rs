@@ -138,11 +138,12 @@ impl ToolHandler for GetCommitDiffHandler {
         // An empty commit reaches git as `show ''`, whose "ambiguous argument"
         // error names neither the tool nor the argument that was missing.
         let commit = super::require_arg(&args, "commit", "get_commit_diff")?;
+        let base = args.get_str("base");
         let path = args.get_str("path");
         let max_bytes = args.get_u64("max_bytes").map(|v| v as usize);
         let context_lines = args.get_u64("context_lines").map(|v| v as usize);
         engine
-            .get_commit_diff(repo, commit, path, max_bytes, context_lines)
+            .get_commit_diff(repo, commit, base, path, max_bytes, context_lines)
             .await
     }
 }
