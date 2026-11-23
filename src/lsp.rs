@@ -965,7 +965,7 @@ impl LspManager {
         base.join(crate::APP_NAME).join("ccls").join(hash)
     }
 
-    /// Get hover information
+    /// Get hover information. `line` is 1-based, as the tools take it.
     pub async fn get_hover(
         &self,
         language: &str,
@@ -991,7 +991,10 @@ impl LspManager {
         let params = HoverParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri },
-                position: Position { line, character },
+                position: Position {
+                    line: line.saturating_sub(1),
+                    character,
+                },
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
@@ -1012,7 +1015,7 @@ impl LspManager {
         Ok(Some(hover))
     }
 
-    /// Get definition location
+    /// Get definition location. `line` is 1-based, as the tools take it.
     pub async fn get_definition(
         &self,
         language: &str,
@@ -1038,7 +1041,10 @@ impl LspManager {
         let params = GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri },
-                position: Position { line, character },
+                position: Position {
+                    line: line.saturating_sub(1),
+                    character,
+                },
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
@@ -2075,5 +2081,87 @@ mod tests {
         let manager = LspManager::new(config, vec![]);
         let result = manager.get_server_command_for_key("rust");
         assert!(result.is_err(), "Should reject relative traversal path");
+    }
+
+    /// A language server that answers hover and definition with the 0-based
+    /// line it was asked about, initialize with no capabilities, and every
+    /// other request with null.
+    const ECHO_POSITION_SERVER: &str = r#"#!/usr/bin/env python3
+import json
+import sys
+
+
+def answer(message):
+    """The result for one request: the asked line, an empty capability set, or None."""
+    method = message["method"]
+    if method == "initialize":
+        return {"capabilities": {}}
+    params = message.get("params")
+    if params is None or "position" not in params:
+        return None
+    line = params["position"]["line"]
+    if method == "textDocument/hover":
+        return {"contents": {"kind": "plaintext", "value": "line %d" % line}}
+    if method == "textDocument/definition":
+        position = {"line": line, "character": 0}
+        return [{"uri": params["textDocument"]["uri"],
+                 "range": {"start": position, "end": position}}]
+    return None
+
+
+while True:
+    header = sys.stdin.buffer.readline()
+    if not header:
+        break
+    length = int(header.split(b":")[1])
+    sys.stdin.buffer.readline()
+    message = json.loads(sys.stdin.buffer.read(length))
+    if "id" not in message:
+        continue
+    reply = json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": answer(message)})
+    body = reply.encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+"#;
+
+    /// The tools and find_symbols count lines from 1, LSP positions from 0.
+    #[tokio::test]
+    async fn test_hover_and_definition_take_a_1_based_line() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let server = temp.path().join("echo-position-server");
+        std::fs::write(&server, ECHO_POSITION_SERVER).unwrap();
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let source = repo.join("xyz.c");
+        std::fs::write(
+            &source,
+            "int xyz_fn(void);\n\nint xyz_fn(void) { return 0; }\n",
+        )
+        .unwrap();
+
+        let config = LspConfig {
+            enabled: true,
+            enabled_languages: HashMap::from([("c".to_string(), true)]),
+            server_paths: HashMap::from([("c".to_string(), server)]),
+            timeout_ms: 30000,
+            ..Default::default()
+        };
+        let manager = LspManager::new(config, vec![repo]);
+
+        let hover = manager
+            .get_hover("c", &source, 3, 4)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hover_to_markdown(&hover), "line 2");
+        let definitions = manager
+            .get_definition("c", &source, 3, 4)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(definitions[0].range.start.line, 2);
     }
 }

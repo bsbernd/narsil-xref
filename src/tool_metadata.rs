@@ -940,8 +940,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
-                    "line": {"type": "integer"},
-                    "character": {"type": "integer"}
+                    "line": {"type": "integer", "description": "Line number (1-indexed)"},
+                    "character": {"type": "integer", "description": "Character position (0-indexed)"}
                 },
                 "required": ["repo", "path", "line", "character"]
             }),
@@ -962,8 +962,8 @@ lazy_static! {
                 "properties": {
                     "repo": {"type": "string"},
                     "path": {"type": "string"},
-                    "line": {"type": "integer"},
-                    "character": {"type": "integer"}
+                    "line": {"type": "integer", "description": "Line number (1-indexed)"},
+                    "character": {"type": "integer", "description": "Character position (0-indexed)"}
                 },
                 "required": ["repo", "path", "line", "character"]
             }),
