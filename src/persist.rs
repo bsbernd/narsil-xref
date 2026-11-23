@@ -81,12 +81,16 @@ pub struct PersistedIndex {
     /// filter. The diff base for sources the manifest cannot describe: a
     /// checkout does not regenerate it, so everything changed since is unlisted.
     pub cdb_head_hash: Option<String>,
+    /// sha256 of the options that choose which files and backends feed the
+    /// symbols (include, index_filter, GTAGS present, LSP backends).
+    pub options_hash: Option<String>,
     /// [`INDEX_LOGIC_VERSION`] the records were produced under. A mismatch with
     /// the running binary's value forces a rebuild, independent of the fingerprint.
     pub logic_version: u32,
 }
 
 impl PersistedIndex {
+    // v9: PersistedIndex/RepoMeta gained options_hash (postcard layout change).
     // v8: PersistedIndex/RepoMeta gained cdb_head_hash (postcard layout change);
     // older records fail to decode and rebuild, which is what gives the new
     // field its first value.
@@ -99,7 +103,7 @@ impl PersistedIndex {
     // v4: added head_hash/cdb_hash fingerprint fields (postcard layout change).
     // v3: Symbol gained confirmed_by/line_conflicts provenance fields, which
     // changes the postcard layout — older indexes must be rebuilt, not misread.
-    const CURRENT_VERSION: u32 = 8;
+    const CURRENT_VERSION: u32 = 9;
 
     pub fn new(repo_root: PathBuf) -> Self {
         let now = SystemTime::now()
@@ -116,6 +120,7 @@ impl PersistedIndex {
             head_hash: None,
             cdb_hash: None,
             cdb_head_hash: None,
+            options_hash: None,
             logic_version: INDEX_LOGIC_VERSION,
         }
     }
@@ -331,6 +336,8 @@ struct RepoMeta {
     /// Mirrors PersistedIndex::cdb_head_hash so the manifest's diff base
     /// survives a restart; without it every restart re-widens from nothing.
     cdb_head_hash: Option<String>,
+    /// Mirrors PersistedIndex::options_hash for the same reason as head_hash.
+    options_hash: Option<String>,
     /// [`INDEX_LOGIC_VERSION`] these records were produced under; a mismatch with
     /// the running binary forces a rebuild even when head/cdb are unchanged.
     logic_version: u32,
@@ -632,6 +639,7 @@ impl IndexStore {
                     index.head_hash = meta.head_hash;
                     index.cdb_hash = meta.cdb_hash;
                     index.cdb_head_hash = meta.cdb_head_hash;
+                    index.options_hash = meta.options_hash;
                     index.logic_version = meta.logic_version;
                 }
             }
@@ -705,6 +713,7 @@ impl IndexStore {
                 head_hash: index.head_hash.clone(),
                 cdb_hash: index.cdb_hash.clone(),
                 cdb_head_hash: index.cdb_head_hash.clone(),
+                options_hash: index.options_hash.clone(),
                 logic_version: index.logic_version,
             };
             meta_table.insert("repo", postcard::to_stdvec(&meta)?.as_slice())?;
@@ -759,6 +768,7 @@ impl IndexStore {
                 head_hash: None,
                 cdb_hash: None,
                 cdb_head_hash: None,
+                options_hash: None,
                 logic_version: INDEX_LOGIC_VERSION,
             });
             meta.updated_at = now_secs();
