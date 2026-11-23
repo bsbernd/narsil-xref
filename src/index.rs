@@ -6176,9 +6176,9 @@ impl CodeIntelEngine {
         max_commits: usize,
     ) -> Result<String> {
         let repo_key = self.resolve_repo(repo)?;
-        let repo_path = PathBuf::from(&repo_key);
-        // Validate path to prevent traversal attacks
-        validate_path(&repo_path, path)?;
+        // A deleted file is the usual reason to ask for its history: the path
+        // is a pathspec that has to stay in the repo, not a file that exists.
+        validate_pathspec(path)?;
 
         let git_repo = self.git_repos.get(&repo_key).ok_or_else(|| {
             anyhow!(
@@ -10924,6 +10924,44 @@ similarity index 90%
             .unwrap();
         assert!(capped.len() < diff.len(), "max_bytes did not shrink");
         assert!(capped.contains("## Files not shown"));
+    }
+
+    /// A file deleted by a later commit is absent from the working tree, and
+    /// its history is still wanted.
+    #[tokio::test]
+    async fn get_file_history_answers_for_a_deleted_file() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        write_file(&repo.join("xyz_gone.txt"), "one\n");
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-q", "-m", "add xyz_gone"]);
+        run_git(&repo, &["rm", "-q", "xyz_gone.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "remove xyz_gone"]);
+
+        let engine = CodeIntelEngine::with_options(
+            temp.path().join("index"),
+            vec![repo.clone()],
+            EngineOptions {
+                git_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let history = engine
+            .get_file_history(repo.to_str().unwrap(), "xyz_gone.txt", 10)
+            .await
+            .unwrap();
+        assert!(history.contains("add xyz_gone"), "history: {history}");
+        assert!(history.contains("remove xyz_gone"), "history: {history}");
+
+        let escape = engine
+            .get_file_history(repo.to_str().unwrap(), "../outside.txt", 10)
+            .await;
+        assert!(escape.is_err());
     }
 
     /// The file a commit deletes is absent from the working tree, and it is
