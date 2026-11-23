@@ -1423,6 +1423,29 @@ impl CodeIntelEngine {
         )
     }
 
+    /// Note appended to a zero-symbol find_symbols answer in a repo whose
+    /// index_filter restricted the index, so the miss names the filter and
+    /// the key that widens it. `lookup` is the file_pattern, else the name.
+    fn index_filter_note(&self, repo: &str, lookup: Option<&str>) -> String {
+        if !self.repo_index_filtered(repo) {
+            return String::new();
+        }
+        let rules: Vec<String> = self
+            .repo_index_filter_rules(repo)
+            .iter()
+            .map(|rule| format!("`{}`", rule.text()))
+            .collect();
+        format!(
+            "> Note: {} indexes only {} (`index_filter` in config.yaml, or \
+             `--index-filter`), plus files that code there calls or includes. \
+             Nothing indexed matches `{}`; if it lies outside those paths, add \
+             its directory to `index_filter`, then reindex.\n\n",
+            repo,
+            rules.join(", "),
+            lookup.unwrap_or("*")
+        )
+    }
+
     /// Whether gtags is intended for `repo_path`, ignoring whether a GTAGS db
     /// exists yet (used by the auto-generate gate, which runs before the db is
     /// built). The per-repo `gtags: { enabled }` override wins over the global
@@ -3994,10 +4017,11 @@ impl CodeIntelEngine {
         let total = filtered.len();
 
         // A file_pattern that matched nothing is indistinguishable from "this
-        // file has no symbols" unless the compile_commands filter is the
-        // actual reason -- name it instead of a bare zero.
+        // file has no symbols" unless the compile_commands filter or the
+        // index_filter is the actual reason -- name it instead of a bare zero.
         let filter_note = if total == 0 {
             self.compile_commands_filter_note(&repo, file_glob.as_ref())
+                + &self.index_filter_note(&repo, file_pattern.or(pattern))
         } else {
             String::new()
         };
@@ -13036,6 +13060,49 @@ similarity index 90%
             .unwrap();
         assert!(output.contains("xyz_sub/xyz.c"), "{output}");
         assert!(!output.contains("submodule"), "{output}");
+    }
+
+    /// Regression: find_symbols answered a lookup outside the index_filter
+    /// with a bare zero, as if the symbol did not exist.
+    #[tokio::test]
+    async fn find_symbols_names_index_filter_as_the_reason_for_zero() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        write_file(&repo.join("kept/xyz_kept.rs"), "pub fn xyz_kept() {}\n");
+        write_file(&repo.join("other/xyz_other.rs"), "pub fn xyz_other() {}\n");
+        let engine = CodeIntelEngine::with_options(
+            tmp.path().join("index"),
+            vec![repo.clone()],
+            EngineOptions {
+                index_filter: vec!["kept".to_string()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        engine.complete_initialization().await.unwrap();
+        let repo_key = canonical_repo_key(&repo).unwrap();
+
+        let by_name = engine
+            .find_symbols(&repo_key, None, Some("xyz_other"), None, None, 100)
+            .await
+            .unwrap();
+        assert!(by_name.contains("Found 0 symbols"), "{by_name}");
+        assert!(by_name.contains("indexes only `kept`"), "{by_name}");
+        assert!(by_name.contains("`xyz_other`"), "{by_name}");
+
+        let by_file = engine
+            .find_symbols(&repo_key, None, Some("*"), Some("other/*"), None, 100)
+            .await
+            .unwrap();
+        assert!(by_file.contains("indexes only `kept`"), "{by_file}");
+        assert!(by_file.contains("`other/*`"), "{by_file}");
+
+        let found = engine
+            .find_symbols(&repo_key, None, Some("xyz_kept"), None, None, 100)
+            .await
+            .unwrap();
+        assert!(!found.contains("index_filter"), "{found}");
     }
 
     #[test]
