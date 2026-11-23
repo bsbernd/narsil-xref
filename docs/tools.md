@@ -165,7 +165,7 @@ takes ~13 s for one function and emits the false positives described below.
 | `get_blame` | path | Get git blame information for a file |
 | `get_branch_info` | — | Get current branch name and repository status |
 | `get_commit_diff` | commit | Get the diff for a specific commit |
-| `get_commit_range` | base | List commits in base..branch and their merge-base, oldest first |
+| `get_commit_range` | — | List commits in base..branch (or all of branch) and their merge-base, oldest first; filter by path, by text a diff adds or removes (pickaxe), or by commit message |
 | `get_contributors` | — | Get contributors to a file or repository |
 | `get_file_history` | path | Get git commit history for a file |
 | `get_hotspots` | — | Find code hotspots - files changed most often in the last `days`, with the most complex function of each file when the call graph is enabled (`min_complexity` then keeps files whose most complex function reaches it) |

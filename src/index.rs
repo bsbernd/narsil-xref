@@ -6606,16 +6606,16 @@ impl CodeIntelEngine {
     pub async fn get_commit_range(
         &self,
         repo: &str,
-        base: &str,
+        base: Option<&str>,
         branch: &str,
-        paths: &[String],
+        filter: &crate::git::CommitFilter<'_>,
         include_body: bool,
         window: response_budget::ListWindow,
     ) -> Result<String> {
         let repo_key = self.resolve_repo(repo)?;
         // A path the range deleted is gone from the working tree, so check
         // containment only.
-        for path in paths {
+        for path in filter.paths {
             validate_pathspec(path)?;
         }
         let git_repo = self.git_repos.get(&repo_key).ok_or_else(|| {
@@ -6624,13 +6624,27 @@ impl CodeIntelEngine {
                 repo_key
             )
         })?;
-        let range = git_repo.commit_range(base, branch, paths, include_body, window)?;
-        let mut output = format!(
-            "# Commits in `{base}..{branch}`\n\nMerge base: `{}`\n\nFound {} commits (oldest first)\n\n",
-            range.merge_base, range.total
-        );
+        let range = git_repo.commit_range(base, branch, filter, include_body, window)?;
+        let mut output = match (base, &range.merge_base) {
+            (Some(base), Some(merge_base)) => {
+                format!("# Commits in `{base}..{branch}`\n\nMerge base: `{merge_base}`\n\n")
+            }
+            _ => format!("# Commits in `{branch}`\n\n"),
+        };
+        match range.total {
+            Some(total) => output.push_str(&format!("Found {total} commits (oldest first)\n\n")),
+            None => output.push_str(&format!(
+                "Showing {} matching commits from offset {} (newest first)\n\n",
+                range.commits.len(),
+                window.offset
+            )),
+        }
         for commit in &range.commits {
-            output.push_str(&format!("- `{}` {}\n", commit.hash, commit.subject));
+            let (date, _) = crate::metrics::utc_date_and_time(commit.timestamp as u64);
+            output.push_str(&format!(
+                "- `{}` {} ({}, {})\n",
+                commit.hash, commit.subject, commit.author, date
+            ));
             if include_body && !commit.body.is_empty() {
                 for line in commit.body.lines() {
                     output.push_str(&format!("  {line}\n"));
@@ -6638,13 +6652,26 @@ impl CodeIntelEngine {
                 output.push('\n');
             }
         }
-        let page = response_budget::ListCap {
-            tool: "get_commit_range",
-            total: range.total,
-            shown: range.commits.len(),
-            offset: window.offset.min(range.total),
-        };
-        output.push_str(&page.footer());
+        match range.total {
+            Some(total) => {
+                let page = response_budget::ListCap {
+                    tool: "get_commit_range",
+                    total,
+                    shown: range.commits.len(),
+                    offset: window.offset.min(total),
+                };
+                output.push_str(&page.footer());
+            }
+            None => {
+                if window.limit != 0 && range.commits.len() == window.limit {
+                    output.push_str(&format!(
+                        "*{} shown, more may exist. Next page: get_commit_range(offset={}).*\n",
+                        range.commits.len(),
+                        window.offset + range.commits.len()
+                    ));
+                }
+            }
+        }
         Ok(output)
     }
 
