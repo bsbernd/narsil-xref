@@ -3441,7 +3441,7 @@ impl CodeIntelEngine {
 
     /// "Come back later" for a repo that is registered but not indexed yet, so
     /// a client retries instead of calling it unknown and reindexing it.
-    fn first_pass_busy(&self, repo_key: &str) -> Option<IndexBusy> {
+    pub(crate) fn first_pass_busy(&self, repo_key: &str) -> Option<IndexBusy> {
         if !self.repos_being_indexed().iter().any(|key| key == repo_key) {
             return None;
         }

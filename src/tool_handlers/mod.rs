@@ -190,7 +190,14 @@ async fn query_leases(
     let repos = match args.get_str("repo") {
         // An unresolvable repo is the handler's error to report, not ours.
         Some(repo) => match engine.resolve_repo(repo) {
-            Ok(key) => vec![key],
+            Ok(key) => {
+                // Before its first pass the repo's index is empty, and every
+                // answer would read "nothing found".
+                if let Some(busy) = engine.first_pass_busy(&key) {
+                    return Err(busy.into());
+                }
+                vec![key]
+            }
             Err(_) => return Ok(Vec::new()),
         },
         // No repo named: the tool searches every indexed repo, so one repo
@@ -469,6 +476,28 @@ mod tests {
         // refused by the very update it is asking about.
         let status = registry.dispatch("get_index_status", &engine, args).await;
         assert!(status.is_ok(), "{:?}", status.err());
+    }
+
+    /// A registered repo whose first index pass has not run has an empty index,
+    /// so search_code would report "Found 0 results" for code that exists.
+    #[tokio::test]
+    async fn index_backed_tools_get_eagain_before_the_first_pass() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("xyz.c"), "int xyz_fn(void) { return 0; }\n").unwrap();
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![repo.clone()])
+            .await
+            .unwrap();
+        let registry = ToolRegistry::new();
+        let args = serde_json::json!({ "repo": repo.to_str().unwrap(), "query": "xyz_fn" });
+
+        let refused = registry
+            .dispatch("search_code", &engine, args)
+            .await
+            .expect_err("the repo has no finished index pass");
+        let busy = refused.downcast_ref::<IndexBusy>().expect("EAGAIN");
+        assert!(busy.first_pass);
     }
 
     /// A path pasted from a search result or an editor is absolute and already
