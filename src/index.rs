@@ -7833,7 +7833,8 @@ impl CodeIntelEngine {
         match_lines: &[usize],
         config: crate::extract::ExcerptConfig,
     ) -> Result<String> {
-        let repo_path = PathBuf::from(self.resolve_repo(repo)?);
+        let repo_key = self.resolve_repo(repo)?;
+        let repo_path = PathBuf::from(&repo_key);
         let file_path = validate_path(&repo_path, path)?;
         if file_path.is_dir() {
             return Err(anyhow!("'{}' is a directory, not a file", path));
@@ -7841,7 +7842,13 @@ impl CodeIntelEngine {
 
         let content = std::fs::read_to_string(&file_path).context("Failed to read file")?;
 
-        let excerpts = crate::extract::extract_excerpts(&content, match_lines, &config);
+        let symbols = self.symbols.get(&repo_key);
+        let enclosing_scope = |line| {
+            let symbol = Self::enclosing_function_at(symbols.as_deref()?, path, line)?;
+            Some((symbol.start_line, symbol.end_line))
+        };
+        let excerpts =
+            crate::extract::extract_excerpts(&content, match_lines, &config, enclosing_scope);
         let best = crate::extract::select_best_excerpt(&excerpts, 3);
 
         let mut output = String::new();
@@ -10999,6 +11006,49 @@ similarity index 90%
             listing.contains("Being Indexed") && listing.contains(&key),
             "{listing}"
         );
+    }
+
+    /// get_excerpt with expand_to_scope returned the default window for a C
+    /// function whose brace sits on its own line, starting in the function above.
+    #[tokio::test]
+    async fn excerpt_scope_is_the_enclosing_c_function() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("adopted");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        write_file(
+            &repo.join("xyz.c"),
+            "static int xyz_first(int value)\n\
+             {\n\
+             \tint doubled = value * 2;\n\
+             \treturn doubled;\n\
+             }\n\
+             \n\
+             static int xyz_second(int value)\n\
+             {\n\
+             \tint tripled = value * 3;\n\
+             \tif (tripled > 9)\n\
+             \t\ttripled = 9;\n\
+             \treturn tripled;\n\
+             }\n",
+        );
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![])
+            .await
+            .unwrap();
+        let key = engine
+            .register_unknown_repo(&repo.to_string_lossy())
+            .unwrap();
+        engine.reindex(Some(&key)).await.unwrap();
+
+        let excerpt = engine
+            .get_excerpt(
+                &key,
+                "xyz.c",
+                &[10],
+                crate::extract::ExcerptConfig::default(),
+            )
+            .await
+            .unwrap();
+        assert!(excerpt.contains("Lines 7-13 "), "{excerpt}");
     }
 
     /// "(19/19 repos indexed)" was reported while qemu, adopted on top of 19

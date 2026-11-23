@@ -58,11 +58,15 @@ pub struct Excerpt {
     pub relevance: f32,
 }
 
-/// Extract excerpts from source code around match locations
+/// Extract excerpts from source code around match locations.
+///
+/// `enclosing_scope` gives the 1-indexed, inclusive line range of the indexed
+/// symbol that holds a line, else `None`.
 pub fn extract_excerpts(
     source: &str,
     match_lines: &[usize],
     config: &ExcerptConfig,
+    enclosing_scope: impl Fn(usize) -> Option<(usize, usize)>,
 ) -> Vec<Excerpt> {
     let lines: Vec<&str> = source.lines().collect();
     let total_lines = lines.len();
@@ -91,7 +95,8 @@ pub fn extract_excerpts(
         .into_iter()
         .map(|(start, end, matches)| {
             let (final_start, final_end) = if config.expand_to_scope {
-                expand_to_scope(&lines, start, end)
+                symbol_scope(&matches, &enclosing_scope, total_lines)
+                    .unwrap_or_else(|| expand_to_scope(&lines, start, end))
             } else {
                 (start, end)
             };
@@ -156,6 +161,26 @@ fn merge_ranges(mut ranges: Vec<(usize, usize, Vec<usize>)>) -> Vec<(usize, usiz
     }
 
     merged
+}
+
+/// The `lines[start..end]` range of the indexed symbols that hold the
+/// matches. `None` when a match lies outside every symbol.
+fn symbol_scope(
+    matches: &[usize],
+    enclosing_scope: &impl Fn(usize) -> Option<(usize, usize)>,
+    total_lines: usize,
+) -> Option<(usize, usize)> {
+    let mut scope: Option<(usize, usize)> = None;
+    for &line in matches {
+        let (first_line, last_line) = enclosing_scope(line)?;
+        let start = first_line.saturating_sub(1);
+        let end = last_line.min(total_lines);
+        scope = match scope {
+            None => Some((start, end)),
+            Some((scope_start, scope_end)) => Some((scope_start.min(start), scope_end.max(end))),
+        };
+    }
+    scope
 }
 
 /// Expand range to include complete syntactic scope (function, class, etc.)
@@ -500,7 +525,7 @@ fn main() {
             ..Default::default()
         };
 
-        let excerpts = extract_excerpts(source, &[4], &config);
+        let excerpts = extract_excerpts(source, &[4], &config, |_| None);
         assert!(!excerpts.is_empty());
         assert!(excerpts[0].content.contains("42"));
     }
@@ -537,7 +562,7 @@ fn main() {
             ..Default::default()
         };
 
-        let excerpts = extract_excerpts(&source, &[requested], &config);
+        let excerpts = extract_excerpts(&source, &[requested], &config, |_| None);
         assert_eq!(excerpts.len(), 1);
         assert!(
             excerpts[0].content.contains("the_requested_line"),
