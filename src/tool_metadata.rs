@@ -777,7 +777,7 @@ lazy_static! {
 
         map.insert("get_hotspots", ToolMetadata {
             name: "get_hotspots",
-            description: "Find code hotspots - files with high churn and complexity. Requires --git flag.",
+            description: "Find code hotspots - files changed most often in the last `days`, with the most complex function of each file when the call graph is enabled (`min_complexity` then keeps files whose most complex function reaches it). History before a rename counts under the current path; deleted files are left out. Requires --git flag; complexity also needs --call-graph.",
             category: ToolCategory::Git,
             tags: ["git", "hotspots", "churn", "complexity", "analysis"].iter().copied().collect(),
             stability: StabilityLevel::Stable,

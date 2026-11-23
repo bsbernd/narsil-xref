@@ -6284,7 +6284,7 @@ impl CodeIntelEngine {
         &self,
         repo: &str,
         days: u32,
-        _min_complexity: Option<usize>,
+        min_complexity: Option<usize>,
     ) -> Result<String> {
         let repo_key = self.resolve_repo(repo)?;
         let git_repo = self.git_repos.get(&repo_key).ok_or_else(|| {
@@ -6295,22 +6295,99 @@ impl CodeIntelEngine {
         })?;
 
         let freq = git_repo.change_frequency(days)?;
+        let complexity = self.max_complexity_by_file(&repo_key);
 
         let mut output = String::new();
         output.push_str(&format!("# Code Hotspots (last {} days)\n\n", days));
-        output.push_str("Files with high change frequency (potential maintenance burden):\n\n");
 
-        output.push_str("| File | Commits | Authors | Churn Score |\n");
-        output.push_str("|------|---------|---------|-------------|\n");
+        let Some(complexity) = complexity else {
+            output.push_str("Files with high change frequency (potential maintenance burden). ");
+            output.push_str("Complexity needs the call graph (--call-graph)");
+            if min_complexity.is_some() {
+                output.push_str(", so `min_complexity` was not applied");
+            }
+            output.push_str(".\n\n");
+            output.push_str("| File | Commits | Authors | Churn Score |\n");
+            output.push_str("|------|---------|---------|-------------|\n");
+            for item in freq.iter().take(20) {
+                output.push_str(&format!(
+                    "| `{}` | {} | {} | {:.2} |\n",
+                    item.file_path, item.total_commits, item.unique_authors, item.churn_score
+                ));
+            }
+            return Ok(output);
+        };
 
-        for item in freq.iter().take(20) {
+        // git names files from the git top, the call graph from the repo root.
+        let repo_prefix = Path::new(&repo_key)
+            .strip_prefix(git_repo.root())
+            .unwrap_or(Path::new(""))
+            .to_path_buf();
+        output.push_str(
+            "Files with high change frequency, with the most complex function in each \
+             (renames followed, deleted files left out):\n\n",
+        );
+        let mut rows = Vec::new();
+        for item in &freq {
+            let repo_rel = Path::new(&item.file_path)
+                .strip_prefix(&repo_prefix)
+                .unwrap_or(Path::new(&item.file_path));
+            let file_complexity = complexity.get(repo_rel.to_string_lossy().as_ref());
+            if let Some(min) = min_complexity {
+                if !file_complexity.is_some_and(|(cc, _)| *cc >= min) {
+                    continue;
+                }
+            }
+            rows.push((item, file_complexity));
+            if rows.len() == 20 {
+                break;
+            }
+        }
+        if rows.is_empty() {
+            output.push_str("*No files match the criteria.*\n");
+            return Ok(output);
+        }
+        output.push_str("| File | Commits | Authors | Churn Score | Max CC | Function |\n");
+        output.push_str("|------|---------|---------|-------------|--------|----------|\n");
+        for (item, file_complexity) in rows {
+            let (cc, function) = match file_complexity {
+                Some((cc, function)) => (cc.to_string(), format!("`{}`", function)),
+                None => ("-".to_string(), "-".to_string()),
+            };
             output.push_str(&format!(
-                "| `{}` | {} | {} | {:.2} |\n",
-                item.file_path, item.total_commits, item.unique_authors, item.churn_score
+                "| `{}` | {} | {} | {:.2} | {} | {} |\n",
+                item.file_path,
+                item.total_commits,
+                item.unique_authors,
+                item.churn_score,
+                cc,
+                function
             ));
         }
 
         Ok(output)
+    }
+
+    /// Highest cyclomatic complexity per repo-relative file and the function
+    /// carrying it, from the call graph. `None` when there is no call graph.
+    fn max_complexity_by_file(&self, repo_key: &str) -> Option<HashMap<String, (usize, String)>> {
+        let call_graph = self.call_graphs.get(repo_key)?;
+        let root = Path::new(repo_key);
+        let mut by_file: HashMap<String, (usize, String)> = HashMap::new();
+        for node in call_graph.iter_nodes() {
+            let path = Path::new(&node.file_path);
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            let cc = node.metrics.cyclomatic;
+            let entry = by_file.entry(rel).or_insert((0, String::new()));
+            if cc > entry.0 {
+                *entry = (cc, node.name.clone());
+            }
+        }
+        Some(by_file)
     }
 
     /// Get contributors to a file or repository
@@ -12257,6 +12334,64 @@ similarity index 90%
             .await
             .expect_err("search_code answered for every file");
         assert!(err.to_string().contains("glob"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn get_hotspots_follows_renames_and_reports_complexity() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path();
+        run_git(repo_path, &["init", "-q"]);
+        let tangled = "pub fn tangled(a: u32) -> u32 {\n    if a > 1 {\n        if a > 2 {\n            return 2;\n        }\n        return 1;\n    }\n    0\n}\n";
+        write_file(&repo_path.join("old.rs"), tangled);
+        write_file(
+            &repo_path.join("plain.rs"),
+            "pub fn plain() -> u32 {\n    1\n}\n",
+        );
+        write_file(&repo_path.join("gone.rs"), "pub fn gone() {}\n");
+        run_git(repo_path, &["add", "."]);
+        run_git(repo_path, &["commit", "-qm", "one"]);
+        write_file(&repo_path.join("old.rs"), &format!("{tangled}// touched\n"));
+        run_git(repo_path, &["commit", "-qam", "two"]);
+        run_git(repo_path, &["mv", "old.rs", "new.rs"]);
+        run_git(repo_path, &["rm", "-q", "gone.rs"]);
+        run_git(repo_path, &["commit", "-qm", "rename"]);
+
+        let temp = TempDir::new().unwrap();
+        let engine = CodeIntelEngine::with_options(
+            temp.path().join("index"),
+            vec![repo_path.to_path_buf()],
+            EngineOptions {
+                git_enabled: true,
+                call_graph_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        engine.complete_initialization().await.unwrap();
+        let repo_key = canonical_repo_key(repo_path).unwrap();
+
+        let out = engine.get_hotspots(&repo_key, 30, None).await.unwrap();
+        let new_row = out
+            .lines()
+            .find(|l| l.contains("`new.rs`"))
+            .unwrap_or_default();
+        assert!(
+            new_row.starts_with("| `new.rs` | 3 |"),
+            "history before the rename is lost:\n{out}"
+        );
+        assert!(
+            new_row.contains("`tangled`"),
+            "most complex function missing:\n{out}"
+        );
+        assert!(!out.contains("old.rs"), "renamed-away path listed:\n{out}");
+        assert!(!out.contains("gone.rs"), "deleted file listed:\n{out}");
+
+        let filtered = engine.get_hotspots(&repo_key, 30, Some(2)).await.unwrap();
+        assert!(
+            filtered.contains("`new.rs`") && !filtered.contains("`plain.rs`"),
+            "min_complexity not applied:\n{filtered}"
+        );
     }
 
     #[test]
