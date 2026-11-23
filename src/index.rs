@@ -3852,7 +3852,7 @@ impl CodeIntelEngine {
 
         let repo_path = PathBuf::from(&repo);
         for (kind, syms) in by_kind {
-            output.push_str(&format!("## {:?}s\n\n", kind));
+            output.push_str(&format!("## {}\n\n", kind.plural_name()));
             for sym in syms {
                 let is_cxx = matches!(get_language_from_path(&sym.file_path).as_str(), "c" | "cpp");
                 let provenance = render_provenance(
@@ -12533,6 +12533,27 @@ similarity index 90%
     #[test]
     fn compile_file_pattern_rejects_unbalanced_brace() {
         assert!(compile_file_pattern("**/*.{json").is_err());
+    }
+
+    /// find_symbols headed each kind with its Debug name plus "s", which
+    /// gave "## TypeAliass" for a C typedef.
+    #[tokio::test]
+    async fn find_symbols_headings_are_english_plurals() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        write_file(&repo.join("xyz.c"), "typedef int xyz_t;\n");
+        let engine = CodeIntelEngine::new(tmp.path().join("index"), vec![repo.to_path_buf()])
+            .await
+            .unwrap();
+        engine.complete_initialization().await.unwrap();
+        let repo_key = canonical_repo_key(repo).unwrap();
+
+        let output = engine
+            .find_symbols(&repo_key, None, Some("xyz_t"), None, None, 100)
+            .await
+            .unwrap();
+
+        assert!(output.contains("## Type aliases\n"), "{output}");
     }
 
     #[test]
