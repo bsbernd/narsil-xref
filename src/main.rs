@@ -215,7 +215,7 @@ struct ServerArgs {
     /// Expose only these tool groups in tools/list. Example: --expose code,git
     ///
     /// Comma-separated and composable; repo-addressing tools are always
-    /// present. Empty exposes every tool. Tool schemas are re-sent on
+    /// present. Empty exposes code and git. Tool schemas are re-sent on
     /// every request, so an unused group costs context all session.
     ///
     ///   code          symbols, references, search, file text; call and

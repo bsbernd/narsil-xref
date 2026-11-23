@@ -344,6 +344,24 @@ fn test_expose_narrows_to_selected_groups() {
     );
 }
 
+/// The tools/list filter without `--expose` or config `expose:`.
+#[test]
+fn test_no_expose_leaves_out_analysis() {
+    let enabled = ToolFilter::new(ToolConfig::default(), &all_features_enabled())
+        .with_expose(&[])
+        .get_enabled_tools();
+
+    assert!(enabled.contains(&"find_symbols"), "code group");
+    assert!(enabled.contains(&"get_blame"), "git group");
+    assert!(!enabled.contains(&"get_code_graph"), "analysis group");
+
+    let enabled = ToolFilter::new(ToolConfig::default(), &all_features_enabled())
+        .with_expose(&[ExposeGroup::Code, ExposeGroup::Git, ExposeGroup::Analysis])
+        .get_enabled_tools();
+
+    assert!(enabled.contains(&"get_code_graph"), "analysis listed");
+}
+
 /// A top-level `expose:` in config.yaml is the machine-wide default, for
 /// invocations whose command line comes from an editor plugin.
 #[test]

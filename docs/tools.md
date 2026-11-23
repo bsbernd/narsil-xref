@@ -17,8 +17,9 @@ $ narsil-xref --expose code                # navigation only
 $ narsil-xref --expose code,git,analysis   # when you want metrics and graphs
 ```
 
-Comma-separated and composable. `base` is always included. An empty `--expose`
-exposes every registered tool.
+Comma-separated and composable. `base` is always included. Without any
+`--expose`, `NARSIL_EXPOSE` or `expose:` setting, the server lists the `code`
+and `git` groups.
 
 Groups can also be set without touching the command line, which matters when
 the invocation comes from an editor plugin. First match wins:
