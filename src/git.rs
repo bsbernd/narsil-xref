@@ -403,6 +403,16 @@ impl GitRepo {
         Ok(paths)
     }
 
+    /// Local and remote branches, one line each: name, short hash, subject
+    pub fn list_branches(&self) -> Result<Vec<String>> {
+        let listing = self.git_output(&[
+            "branch",
+            "-a",
+            "--format=%(refname:short) %(objectname:short) %(subject)",
+        ])?;
+        Ok(listing.lines().map(String::from).collect())
+    }
+
     /// Contents of `path` in the tree of `revision`
     pub fn blob_at_revision(&self, revision: &str, path: &str) -> Result<String> {
         Self::validate_input(revision, "revision")?;

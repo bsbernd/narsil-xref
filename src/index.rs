@@ -6404,6 +6404,7 @@ impl CodeIntelEngine {
         &self,
         repo: &str,
         window: response_budget::ListWindow,
+        list_branches: bool,
     ) -> Result<String> {
         let repo_key = self.resolve_repo(repo)?;
         let git_repo = self.git_repos.get(&repo_key).ok_or_else(|| {
@@ -6459,6 +6460,19 @@ impl CodeIntelEngine {
                     output.push('\n');
                     output.push_str(&capped.footer());
                 }
+            }
+        }
+
+        if list_branches {
+            output.push_str("\n## Branches\n\n");
+            let branches = git_repo.list_branches()?;
+            let (page, capped) = response_budget::cap(&branches, window, "get_branch_info");
+            for branch in page {
+                output.push_str(&format!("- {}\n", branch));
+            }
+            if capped.truncated() {
+                output.push('\n');
+                output.push_str(&capped.footer());
             }
         }
 
@@ -10785,7 +10799,7 @@ mod tests {
         let repo_key = canonical_repo_key(repo_path).unwrap();
 
         let output = engine
-            .get_branch_info(&repo_key, response_budget::ListWindow::new(0, 20))
+            .get_branch_info(&repo_key, response_budget::ListWindow::new(0, 20), false)
             .await
             .unwrap();
         assert_eq!(
@@ -10805,7 +10819,7 @@ mod tests {
 
         // limit=0 is the documented escape hatch for "give me everything".
         let output = engine
-            .get_branch_info(&repo_key, response_budget::ListWindow::new(0, 0))
+            .get_branch_info(&repo_key, response_budget::ListWindow::new(0, 0), false)
             .await
             .unwrap();
         assert_eq!(output.matches(" step ").count(), 25);
@@ -10857,6 +10871,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(all.matches("xyz step").count(), 25, "output: {all}");
+    }
+
+    /// `branches` adds the local and remote branches to get_branch_info.
+    #[tokio::test]
+    async fn get_branch_info_lists_branches_on_request() {
+        let temp = TempDir::new().unwrap();
+        let origin = temp.path().join("origin");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&origin).unwrap();
+        run_git(&origin, &["init", "-q"]);
+        write_file(&origin.join("xyz.txt"), "one");
+        run_git(&origin, &["add", "xyz.txt"]);
+        run_git(&origin, &["commit", "-q", "-m", "xyz base"]);
+        run_git(&origin, &["branch", "xyz-remote-only"]);
+        run_git(temp.path(), &["clone", "-q", "origin", "repo"]);
+        run_git(&repo, &["branch", "xyz-local-only"]);
+
+        let engine = CodeIntelEngine::with_options(
+            temp.path().join("index"),
+            vec![repo.clone()],
+            EngineOptions {
+                git_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let repo_arg = repo.to_str().unwrap();
+
+        let plain = engine
+            .get_branch_info(repo_arg, response_budget::ListWindow::new(0, 20), false)
+            .await
+            .unwrap();
+        assert!(!plain.contains("## Branches"), "output: {plain}");
+
+        let listed = engine
+            .get_branch_info(repo_arg, response_budget::ListWindow::new(0, 20), true)
+            .await
+            .unwrap();
+        assert!(listed.contains("## Branches"), "output: {listed}");
+        assert!(listed.contains("- xyz-local-only "), "output: {listed}");
+        assert!(
+            listed.contains("- origin/xyz-remote-only "),
+            "output: {listed}"
+        );
+        assert!(listed.contains("xyz base"), "output: {listed}");
+
+        let paged = engine
+            .get_branch_info(repo_arg, response_budget::ListWindow::new(0, 1), true)
+            .await
+            .unwrap();
+        assert!(paged.contains("Showing 1 of"), "output: {paged}");
     }
 
     /// gtags answers with every use of a name. These are the ones that made
