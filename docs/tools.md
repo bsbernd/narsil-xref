@@ -168,7 +168,7 @@ takes ~13 s for one function and emits the false positives described below.
 | `get_commit_range` | base | List commits in base..branch and their merge-base, oldest first |
 | `get_contributors` | — | Get contributors to a file or repository |
 | `get_file_history` | path | Get git commit history for a file |
-| `get_hotspots` | — | Find code hotspots - files with high churn and complexity |
+| `get_hotspots` | — | Find code hotspots - files changed most often in the last `days`, with the most complex function of each file when the call graph is enabled (`min_complexity` then keeps files whose most complex function reaches it) |
 | `get_modified_files` | — | Get list of modified files in the working tree |
 | `get_recent_changes` | — | Get recent commits across the repository |
 | `get_symbol_history` | symbol | Get commits that modified a specific symbol/function |
