@@ -147,6 +147,31 @@ impl SymbolKind {
         )
     }
 
+    /// The heading above a list of symbols of this kind.
+    pub fn plural_name(&self) -> &'static str {
+        match self {
+            SymbolKind::Struct => "Structs",
+            SymbolKind::Class => "Classes",
+            SymbolKind::Enum => "Enums",
+            SymbolKind::Interface => "Interfaces",
+            SymbolKind::Trait => "Traits",
+            SymbolKind::TypeAlias => "Type aliases",
+            SymbolKind::Function => "Functions",
+            SymbolKind::Method => "Methods",
+            SymbolKind::Constructor => "Constructors",
+            SymbolKind::Module => "Modules",
+            SymbolKind::Namespace => "Namespaces",
+            SymbolKind::Package => "Packages",
+            SymbolKind::Constant => "Constants",
+            SymbolKind::Variable => "Variables",
+            SymbolKind::Field => "Fields",
+            SymbolKind::Parameter => "Parameters",
+            SymbolKind::Implementation => "Implementations",
+            SymbolKind::Macro => "Macros",
+            SymbolKind::Unknown => "Unknown kind",
+        }
+    }
+
     /// Get icon for display
     pub fn icon(&self) -> &'static str {
         match self {
