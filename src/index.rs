@@ -1881,10 +1881,33 @@ impl CodeIntelEngine {
                 // The build wrote the manifest at one commit; a checkout since
                 // then added sources it cannot list. Carry those, or they vanish
                 // from the index with nothing saying why.
-                let unlisted = cdb_diff_base
+                let mut unlisted = cdb_diff_base
                     .as_deref()
                     .map(|base| self.sources_unlisted_since_cdb(path, base))
                     .unwrap_or_default();
+
+                // A superproject's manifest lists only its own translation
+                // units. Carry the sources of a submodule it lists none of.
+                for submodule in submodule_paths(path) {
+                    let submodule_root = path.join(&submodule);
+                    let sources: Vec<&PathBuf> = files
+                        .iter()
+                        .filter(|abs_path| {
+                            let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                            is_c_source_ext(ext) && abs_path.starts_with(&submodule_root)
+                        })
+                        .collect();
+                    if sources
+                        .iter()
+                        .any(|abs_path| compiled.contains(abs_path.as_path()))
+                    {
+                        continue;
+                    }
+                    for abs_path in sources {
+                        let rel = abs_path.strip_prefix(path).unwrap_or(abs_path);
+                        unlisted.insert(rel.to_string_lossy().into_owned());
+                    }
+                }
                 let before = files.len();
                 let mut carried = 0usize;
                 let mut filtered_out: Vec<PathBuf> = Vec::new();
@@ -1918,7 +1941,8 @@ impl CodeIntelEngine {
                     .unwrap_or(0);
                 info!(
                     "compile_commands filter: {} → {} files ({} filtered out, \
-                     {} carried past a manifest {} commit(s) behind HEAD)",
+                     {} carried past a manifest {} commit(s) behind HEAD \
+                     or in a submodule it does not list)",
                     before,
                     files.len(),
                     before - files.len(),
@@ -12929,6 +12953,80 @@ similarity index 90%
             .unwrap();
 
         assert!(output.contains("## Type aliases\n"), "{output}");
+    }
+
+    /// Regression: the superproject's compile_commands.json lists none of a
+    /// submodule's sources, and the filter dropped them all, so get_callers
+    /// found nothing for a function defined in the submodule.
+    #[tokio::test]
+    async fn submodule_sources_survive_a_superproject_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let listed_names = ["a.c", "b.c", "c.c", "d.c"];
+        for name in listed_names {
+            write_file(
+                &repo.join(name),
+                &format!("void {}(void) {{}}\n", name.replace('.', "_")),
+            );
+        }
+        write_file(
+            &repo.join(".gitmodules"),
+            "[submodule \"xyz_sub\"]\n\tpath = xyz_sub\n\turl = ../xyz_sub\n",
+        );
+        write_file(
+            &repo.join("xyz_sub/src/xyz_callee.c"),
+            "void xyz_callee(void) {}\n",
+        );
+        write_file(
+            &repo.join("xyz_sub/src/xyz_caller.c"),
+            "void xyz_callee(void);\nvoid xyz_caller(void) { xyz_callee(); }\n",
+        );
+        let entries: Vec<String> = listed_names
+            .iter()
+            .map(|name| {
+                format!(
+                    r#"{{"directory": "{}", "command": "cc -c {}", "file": "{}"}}"#,
+                    repo.display(),
+                    name,
+                    repo.join(name).canonicalize().unwrap().display()
+                )
+            })
+            .collect();
+        write_file(
+            &repo.join("compile_commands.json"),
+            &format!("[{}]", entries.join(",")),
+        );
+
+        let engine = CodeIntelEngine::with_options(
+            tmp.path().join("index"),
+            vec![repo.clone()],
+            EngineOptions {
+                use_compile_commands: true,
+                call_graph_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        engine.complete_initialization().await.unwrap();
+        let repo_key = canonical_repo_key(&repo).unwrap();
+
+        let output = engine
+            .find_symbols(&repo_key, None, Some("xyz_callee"), None, None, 100)
+            .await
+            .unwrap();
+        assert!(output.contains("xyz_sub/src/xyz_callee.c"), "{output}");
+        let callers = engine
+            .call_graphs
+            .get(&repo_key)
+            .unwrap()
+            .get_callers("xyz_callee");
+        assert!(
+            callers
+                .iter()
+                .any(|edge| edge.target.ends_with("::xyz_caller")),
+            "{callers:?}"
+        );
     }
 
     #[test]
