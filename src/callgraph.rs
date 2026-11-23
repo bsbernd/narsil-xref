@@ -253,9 +253,27 @@ impl CallGraph {
     }
 
     pub(crate) fn replace_file(&self, file: (String, String, Tree)) -> Result<()> {
+        let path = file.0.clone();
+        let old_keys: HashSet<String> = self
+            .file_functions
+            .get(&path)
+            .map(|keys| keys.iter().cloned().collect())
+            .unwrap_or_default();
         let mut incoming = Vec::new();
-        self.remove_file_edges(&file.0, Some(&mut incoming));
+        self.remove_file_edges(&path, Some(&mut incoming));
         self.build_from_files(&[file])?;
+        let added_names: HashSet<String> = self
+            .file_functions
+            .get(&path)
+            .map(|keys| {
+                keys.iter()
+                    .filter(|key| !old_keys.contains(*key))
+                    .filter_map(|key| key.rsplit("::").next())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.reresolve_calls_named(&added_names, &path);
         for (caller_key, edge) in incoming {
             if !self.nodes.contains_key(&edge.target) {
                 continue;
@@ -272,6 +290,60 @@ impl CallGraph {
             }
         }
         Ok(())
+    }
+
+    /// Point the calls to `names` from files other than `changed_file` at the
+    /// definition each resolves to now. extract_calls() resolves a call once,
+    /// so a call to a function added later stays unresolved or on a namesake.
+    /// An edge an LSP or gtags backend confirmed keeps its target.
+    fn reresolve_calls_named(&self, names: &HashSet<String>, changed_file: &str) {
+        if names.is_empty() {
+            return;
+        }
+        // Resolved and moved after the scan: a lookup or update in `nodes`
+        // while the scan holds a shard lock can deadlock.
+        let mut candidates: Vec<(String, usize, CallEdge)> = Vec::new();
+        for node in self.nodes.iter() {
+            for (call_idx, edge) in node.calls.iter().enumerate() {
+                let bare_name = edge.target.rsplit("::").next().unwrap_or(&edge.target);
+                if edge.file_path != changed_file
+                    && edge.confirmed_by == SourceSet::TREE_SITTER
+                    && names.contains(bare_name)
+                {
+                    candidates.push((node.key().clone(), call_idx, edge.clone()));
+                }
+            }
+        }
+        for (caller_key, call_idx, edge) in candidates {
+            let bare_name = edge.target.rsplit("::").next().unwrap_or(&edge.target);
+            let new_target =
+                self.resolve_callee(bare_name, &edge.file_path, edge.scope_hint.as_deref());
+            if new_target == edge.target {
+                continue;
+            }
+            let old_target = edge.target;
+            let Some(edge) = self.nodes.get_mut(&caller_key).map(|mut caller| {
+                caller.calls[call_idx].target = new_target.clone();
+                caller.calls[call_idx].clone()
+            }) else {
+                continue;
+            };
+            if let Some(mut old_callee) = self.nodes.get_mut(&old_target) {
+                old_callee.called_by.retain(|incoming| {
+                    !(incoming.target == caller_key
+                        && incoming.file_path == edge.file_path
+                        && incoming.line == edge.line
+                        && incoming.column == edge.column)
+                });
+            }
+            if let Some(mut new_callee) = self.nodes.get_mut(&new_target) {
+                new_callee.called_by.push(CallEdge {
+                    target: caller_key,
+                    scope_hint: None,
+                    ..edge
+                });
+            }
+        }
     }
 
     fn remove_file_edges(
@@ -2090,6 +2162,39 @@ mod tests {
 
         graph.remove_file("callee.c");
         assert!(graph.get_callees("caller").is_empty());
+    }
+
+    #[test]
+    fn replacing_a_file_links_calls_from_other_files_to_a_new_function() {
+        let parser = crate::parser::LanguageParser::new().unwrap();
+        let graph = CallGraph::new();
+        let parse = |path: &str, content: &str| {
+            let tree = parser
+                .parse_to_tree(std::path::Path::new(path), content)
+                .unwrap();
+            (path.to_string(), content.to_string(), tree)
+        };
+        graph
+            .build_from_files(&[
+                parse("widget.c", "void widget_old(void) {}"),
+                parse("caller.c", "void caller(void) {\nwidget_new();\n}"),
+            ])
+            .unwrap();
+        assert_eq!(graph.get_callees("caller")[0].target, "widget_new");
+
+        graph
+            .replace_file(parse(
+                "widget.c",
+                "void widget_old(void) {}\nvoid widget_new(void) {}",
+            ))
+            .unwrap();
+        assert_eq!(
+            graph.get_callees("caller")[0].target,
+            "widget.c::widget_new"
+        );
+        let callers = graph.get_callers("widget_new");
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].target, "caller.c::caller");
     }
 
     #[test]
