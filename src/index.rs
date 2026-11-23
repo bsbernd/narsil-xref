@@ -9473,14 +9473,8 @@ fn expand_braces(pattern: &str) -> std::result::Result<Vec<String>, String> {
 }
 
 /// The `file_pattern` glob of a find_symbols or search_code call. A bare file
-/// name matches at any depth.
+/// name, also one brace alternative, matches at any depth.
 fn compile_file_pattern(pattern: &str) -> Result<FilePattern> {
-    let has_wildcard = pattern.contains(['*', '?', '[', '{']);
-    let normalized = if !pattern.contains('/') && !has_wildcard {
-        format!("**/{}", pattern)
-    } else {
-        pattern.to_string()
-    };
     let invalid = |e: &dyn std::fmt::Display| {
         anyhow!(
             "Invalid file_pattern glob '{}': {} (examples: '**/README.md', 'src/**/*.{{rs,toml}}')",
@@ -9488,10 +9482,16 @@ fn compile_file_pattern(pattern: &str) -> Result<FilePattern> {
             e
         )
     };
-    let expanded = expand_braces(&normalized).map_err(|e| invalid(&e))?;
+    let expanded = expand_braces(pattern).map_err(|e| invalid(&e))?;
     let mut patterns = Vec::new();
     for alt in &expanded {
-        patterns.push(glob::Pattern::new(alt).map_err(|e| invalid(&e))?);
+        let bare_name = !alt.contains('/') && !alt.contains(['*', '?', '[']);
+        let normalized = if bare_name {
+            format!("**/{}", alt)
+        } else {
+            alt.to_string()
+        };
+        patterns.push(glob::Pattern::new(&normalized).map_err(|e| invalid(&e))?);
     }
     Ok(FilePattern { patterns })
 }
@@ -12516,6 +12516,18 @@ similarity index 90%
         assert!(fp.matches("README.md"));
         assert!(fp.matches("deploy/values.yml"));
         assert!(!fp.matches("src/main.go"));
+    }
+
+    #[test]
+    fn compile_file_pattern_bare_names_in_braces_match_any_depth() {
+        let fp = compile_file_pattern("{widget.go,gadget.go}").unwrap();
+        assert!(fp.matches("test/helper/widget/widget.go"));
+        assert!(fp.matches("internal/usecase/gadget/impl/gadget.go"));
+        assert!(!fp.matches("internal/usecase/gizmo/impl/gizmo.go"));
+
+        let mixed = compile_file_pattern("{internal/config/*.go,widget.go}").unwrap();
+        assert!(mixed.matches("internal/config/config.go"));
+        assert!(mixed.matches("test/helper/widget/widget.go"));
     }
 
     #[test]
