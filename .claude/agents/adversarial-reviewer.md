@@ -10,7 +10,7 @@ allowed-tools:
   - Bash(npm test *)
   - Bash(cargo test *)
   - Bash(pytest *)
-  - Bash(narsil-mcp *)
+  - Bash(narsil-xref *)
   - MCP
 ---
 

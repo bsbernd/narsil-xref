@@ -9,7 +9,7 @@ allowed-tools:
   - Edit
   - Glob
   - Grep
-  - Bash(narsil-mcp *)
+  - Bash(narsil-xref *)
   - Bash(git *)
   - MCP
 ---
@@ -19,7 +19,7 @@ You maintain synchronization between documentation and code.
 ## Drift Detection
 
 1. Check for undocumented public APIs:
-   - Use narsil-mcp find_symbols to find exported functions
+   - Use narsil-xref find_symbols to find exported functions
    - Compare against docs/api.md
 
 2. Check for stale documentation:

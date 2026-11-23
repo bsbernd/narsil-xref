@@ -5,9 +5,9 @@ if [ -z "$MODIFIED" ]; then
     exit 0
 fi
 
-# Run quick narsil-mcp scan if available
-if command -v narsil-mcp &> /dev/null; then
-    SCAN=$(narsil-mcp scan_security 2>&1) || true
+# Run quick narsil-xref scan if available
+if command -v narsil-xref &> /dev/null; then
+    SCAN=$(narsil-xref scan_security 2>&1) || true
     if echo "$SCAN" | grep -qE "CRITICAL"; then
         echo "CRITICAL security issue found" >&2
         echo "$SCAN" | grep -A2 "CRITICAL" >&2

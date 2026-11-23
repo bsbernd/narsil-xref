@@ -1,13 +1,13 @@
 ---
 name: security-auditor
-description: Security analysis using narsil-mcp
+description: Security analysis using narsil-xref
 context: fork
 model: opus
 allowed-tools:
   - Read
   - Grep
   - Glob
-  - Bash(narsil-mcp *)
+  - Bash(narsil-xref *)
   - MCP
 ---
 

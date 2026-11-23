@@ -10,7 +10,7 @@ allowed-tools:
   - Bash(cargo test *)
   - Bash(cargo clippy *)
   - Bash(git *)
-  - Bash(narsil-mcp *)
+  - Bash(narsil-xref *)
   - Bash(gh *)
   - MCP
 ---
@@ -63,10 +63,10 @@ git status --short
 git log --oneline -10
 git diff --stat HEAD~5 2>/dev/null || git diff --stat
 
-# 4. narsil-mcp Analysis (if available)
-narsil-mcp get_function_hotspots 2>/dev/null || echo "narsil-mcp not available"
-narsil-mcp find_dead_code 2>/dev/null || echo ""
-narsil-mcp scan_security 2>/dev/null | grep -E "CRITICAL|HIGH" || echo "No critical findings"
+# 4. narsil-xref Analysis (if available)
+narsil-xref get_function_hotspots 2>/dev/null || echo "narsil-xref not available"
+narsil-xref find_dead_code 2>/dev/null || echo ""
+narsil-xref scan_security 2>/dev/null | grep -E "CRITICAL|HIGH" || echo "No critical findings"
 
 # 5. Implementation Plan Status
 grep -E "^\s*-\s*\[[ x]\]" IMPLEMENTATION_PLAN.md | head -20
