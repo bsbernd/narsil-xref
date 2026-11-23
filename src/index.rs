@@ -10415,10 +10415,13 @@ fn fold_symbol(existing: &mut Symbol, incoming: Symbol, source: SourceSet) {
     let keep_parsed_end = existing.confirmed_by.contains(SourceSet::TREE_SITTER);
     // clangd reports a C or C++ typedef as a Class.
     let keep_parsed_kind = keep_parsed_end && existing.kind == SymbolKind::TypeAlias;
+    // tree-sitter starts a C function at its return type, an LSP server at its name.
+    let inside_parsed_range = old_canonical == SourceSet::TREE_SITTER
+        && (existing.start_line..=existing.end_line).contains(&incoming.start_line);
     existing.confirmed_by.insert(source);
 
     if source.rank() > old_canonical.rank() {
-        if existing.start_line != incoming.start_line {
+        if existing.start_line != incoming.start_line && !inside_parsed_range {
             existing.line_conflicts.push(SourceLine {
                 source: old_canonical,
                 line: existing.start_line,
@@ -10447,7 +10450,7 @@ fn fold_symbol(existing: &mut Symbol, incoming: Symbol, source: SourceSet) {
         if incoming.doc_comment.is_some() {
             existing.doc_comment = incoming.doc_comment;
         }
-    } else if incoming.start_line != existing.start_line {
+    } else if incoming.start_line != existing.start_line && !inside_parsed_range {
         existing.line_conflicts.push(SourceLine {
             source,
             line: incoming.start_line,
@@ -12069,6 +12072,35 @@ similarity index 90%
             SourceSet::CCLS,
         );
         assert_eq!(gtags_only[0].end_line, 30);
+    }
+
+    /// find_symbols warned "line disagreement: ccls 11, tree-sitter 10" for a
+    /// C function whose return type sits on the line above its name.
+    #[test]
+    fn a_line_inside_the_parsed_range_is_no_line_disagreement() {
+        let enabled = source_set(&[SourceSet::TREE_SITTER, SourceSet::CCLS]);
+        let warning = |ccls_line: usize| {
+            let mut parsed = Symbol {
+                end_line: 20,
+                ..sym("foo", 10, SourceSet::TREE_SITTER)
+            };
+            fold_symbol(
+                &mut parsed,
+                sym("foo", ccls_line, SourceSet::CCLS),
+                SourceSet::CCLS,
+            );
+            render_provenance(
+                ProvenanceSubject::Symbol,
+                enabled,
+                parsed.confirmed_by,
+                parsed.start_line,
+                &parsed.line_conflicts,
+            )
+            .is_some_and(|annotation| annotation.contains("WARNING line disagreement"))
+        };
+
+        assert!(!warning(11));
+        assert!(warning(30));
     }
 
     #[test]
