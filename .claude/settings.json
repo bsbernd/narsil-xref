@@ -5,7 +5,7 @@
       "Bash(pnpm *)",
       "Bash(cargo *)",
       "Bash(git *)",
-      "Bash(narsil-mcp *)",
+      "Bash(narsil-xref *)",
       "Bash(ralph *)",
       "Bash(python *)",
       "Bash(*--help)",
