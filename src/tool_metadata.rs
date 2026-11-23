@@ -769,6 +769,7 @@ lazy_static! {
                     "repo": {"type": "string"},
                     "base": {"type": "string", "description": "Exclude commits reachable from this revision"},
                     "branch": {"type": "string", "description": "Branch or revision to list (default: HEAD)"},
+                    "paths": {"type": "array", "items": {"type": "string"}, "description": "Only commits that touch these repo-relative paths or directories (git log -- <paths>); deleted paths work"},
                     "include_body": {"type": "boolean", "description": "Include commit bodies (default: false)"},
                     "limit": {"type": "integer", "minimum": 0, "description": "Maximum commits to return (default: 50; 0 = all)"},
                     "offset": {"type": "integer", "minimum": 0, "description": "Index of the first commit to list, oldest first (default: 0)"}
