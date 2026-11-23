@@ -517,6 +517,9 @@ pub struct CfgBuilder {
     cfg: ControlFlowGraph,
     /// Stack of loop headers for break/continue
     loop_stack: Vec<(BlockId, BlockId)>, // (header, exit)
+    /// Label name -> the block that starts at its labeled statement. A
+    /// forward goto creates the block before the label is reached.
+    labels: HashMap<String, BlockId>,
 }
 
 impl CfgBuilder {
@@ -526,6 +529,7 @@ impl CfgBuilder {
             next_block_id: 0,
             cfg: ControlFlowGraph::new(function_name, file_path),
             loop_stack: Vec::new(),
+            labels: HashMap::new(),
         }
     }
 
@@ -612,6 +616,17 @@ impl CfgBuilder {
     /// Get current loop exit (for break)
     pub fn current_loop_exit(&self) -> Option<BlockId> {
         self.loop_stack.last().map(|(_, e)| *e)
+    }
+
+    /// The block that starts at label `name`, shared by the labeled statement
+    /// and every goto to it.
+    fn label_block(&mut self, name: &str) -> BlockId {
+        if let Some(&block) = self.labels.get(name) {
+            return block;
+        }
+        let block = self.create_block(&format!("label {name}"));
+        self.labels.insert(name.to_string(), block);
+        block
     }
 
     /// Build and finalize the CFG
@@ -1042,6 +1057,38 @@ impl CfgBuilder {
                 self.set_terminator(current, Terminator::Jump);
                 let next = self.create_block("after_throw");
                 Ok(next)
+            }
+
+            // C, C++ and Go: the label is the first named child.
+            "goto_statement" => {
+                self.add_statement(
+                    current,
+                    Statement {
+                        line,
+                        kind: StatementKind::ControlFlow,
+                        text,
+                    },
+                );
+                self.set_terminator(current, Terminator::Jump);
+                if let Some(label) = node.named_child(0) {
+                    let name = label.utf8_text(source).unwrap_or("");
+                    let target = self.label_block(name);
+                    self.add_edge(current, target, EdgeKind::Jump);
+                }
+                Ok(self.create_block("after_goto"))
+            }
+            "labeled_statement" => {
+                let Some(label) = node.named_child(0) else {
+                    return Ok(current);
+                };
+                let target = self.label_block(label.utf8_text(source).unwrap_or(""));
+                self.add_edge(current, target, EdgeKind::FallThrough);
+
+                let mut active_block = target;
+                for child in node.named_children(&mut node.walk()).skip(1) {
+                    active_block = self.process_statement(active_block, child, source)?;
+                }
+                Ok(active_block)
             }
 
             // Jump expression (Kotlin return, break, continue with labels)
@@ -4124,5 +4171,72 @@ int xyz_check(int a)
             assert_eq!(block.label, "then", "{call}");
             assert!(!cfg.unreachable_blocks.contains(&block.id), "{call}");
         }
+    }
+
+    #[test]
+    fn test_c_goto_reaches_cleanup_label() {
+        let cfg = c_function_cfg(
+            r#"
+int xyz_setup(int a)
+{
+    if (a < 0) {
+        xyz_warn(a);
+        goto out;
+    }
+    if (a > 9)
+        goto out;
+    return xyz_work(a);
+out:
+    xyz_cleanup(a);
+    return -1;
+}
+"#,
+        );
+
+        let out = block_with_statement(&cfg, "xyz_cleanup");
+        assert_eq!(out.label, "label out");
+        assert!(!cfg.unreachable_blocks.contains(&out.id));
+
+        let goto_blocks: Vec<BlockId> = cfg
+            .blocks
+            .values()
+            .filter(|block| block.statements.iter().any(|stmt| stmt.text == "goto out;"))
+            .map(|block| block.id)
+            .collect();
+        assert_eq!(goto_blocks.len(), 2);
+        let predecessors = cfg.predecessors(out.id);
+        for goto_block in goto_blocks {
+            assert!(predecessors.contains(&goto_block), "{predecessors:?}");
+        }
+    }
+
+    /// Block labels and edges of a C function without goto or label.
+    #[test]
+    fn test_c_cfg_without_goto_is_unchanged() {
+        let cfg = c_function_cfg(
+            r#"
+int xyz_check(int a)
+{
+    if (a < 0)
+        return -1;
+    xyz_work(a);
+    return 0;
+}
+"#,
+        );
+
+        let mut block_ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
+        block_ids.sort_unstable();
+        let labels: Vec<&str> = block_ids
+            .iter()
+            .map(|id| cfg.blocks[id].label.as_str())
+            .collect();
+        let edges: Vec<(BlockId, BlockId)> =
+            cfg.edges.iter().map(|edge| (edge.from, edge.to)).collect();
+        assert_eq!(
+            labels,
+            ["entry", "then", "endif", "after_return", "after_return"]
+        );
+        assert_eq!(edges, [(0, 1), (3, 2), (0, 2)]);
     }
 }
