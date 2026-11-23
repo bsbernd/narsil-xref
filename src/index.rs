@@ -3662,17 +3662,15 @@ impl CodeIntelEngine {
             return busy.into();
         }
         if repo.is_empty() {
-            let repo_names: Vec<_> = self.repos.iter().map(|r| r.key().clone()).collect();
-            if repo_names.is_empty() {
+            if self.repos.is_empty() {
                 anyhow!(
                     "Missing required 'repo' parameter. No repositories are indexed yet. \
                      Use --repos flag when starting the server."
                 )
             } else {
                 anyhow!(
-                    "Missing required 'repo' parameter. Available repositories: {}. \
-                     Use list_repos to see all indexed repositories.",
-                    repo_names.join(", ")
+                    "repo is required; pass repo=<path> (list_repos lists the indexed \
+                     repositories)"
                 )
             }
         } else {
@@ -11032,6 +11030,27 @@ mod tests {
             .await
             .unwrap();
         assert!(tree.contains("Project Structure"), "tree: {tree}");
+    }
+
+    /// A call without `repo` named every indexed repository in its error,
+    /// which on a daemon with many repositories is a page of paths.
+    #[tokio::test]
+    async fn a_missing_repo_error_does_not_list_the_repos() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("xyz_first");
+        let second = temp.path().join("xyz_second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![first, second])
+            .await
+            .unwrap();
+        engine.reindex_all().await.unwrap();
+
+        let message = engine.resolve_repo("").unwrap_err().to_string();
+        assert_eq!(
+            message,
+            "repo is required; pass repo=<path> (list_repos lists the indexed repositories)"
+        );
     }
 
     /// gtags answers with every use of a name. These are the ones that made
