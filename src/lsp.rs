@@ -1298,7 +1298,8 @@ impl LspManager {
     /// `call_site_line` is the 1-based line *in this caller* where the call
     /// occurs (from `from_ranges`) — a `CallEdge`'s line is the call site, not
     /// the callee's definition. Empty when the backend has no callHierarchy
-    /// support, the position cannot be anchored, or there are no outgoing calls.
+    /// support, the position cannot be anchored, the function is defined in
+    /// another file than `file_path`, or there are no outgoing calls.
     pub async fn call_hierarchy_outgoing_batch(
         &self,
         backend: SourceSet,
@@ -1390,6 +1391,12 @@ impl LspManager {
             Some(i) => i,
             None => return Vec::new(),
         };
+
+        // ccls resolves a header prototype to the .c definition. Its call sites
+        // are .c lines, and the .c file's own request already reports them.
+        if item.uri != *uri {
+            return Vec::new();
+        }
 
         let out_params = CallHierarchyOutgoingCallsParams {
             item,
@@ -2163,5 +2170,100 @@ while True:
             .unwrap()
             .unwrap();
         assert_eq!(definitions[0].range.start.line, 2);
+    }
+
+    /// A language server that resolves prepareCallHierarchy on a .h file to the
+    /// function in the .c file of the same name, as ccls does for a prototype,
+    /// and answers outgoingCalls with one call of xyz_callee at 0-based line 2.
+    const PROTOTYPE_TO_DEFINITION_SERVER: &str = r#"#!/usr/bin/env python3
+import json
+import sys
+
+
+def function_item(name, uri):
+    """A CallHierarchyItem for function `name` at line 0 of `uri`."""
+    position = {"line": 0, "character": 4}
+    span = {"start": position, "end": position}
+    return {"name": name, "kind": 12, "uri": uri, "range": span, "selectionRange": span}
+
+
+def answer(message):
+    """The result for one request: capabilities, a prepared item, its calls, or None."""
+    method = message["method"]
+    if method == "initialize":
+        return {"capabilities": {}}
+    if method == "textDocument/prepareCallHierarchy":
+        uri = message["params"]["textDocument"]["uri"]
+        if uri.endswith(".h"):
+            uri = uri[:-2] + ".c"
+        return [function_item("xyz_caller", uri)]
+    if method == "callHierarchy/outgoingCalls":
+        uri = message["params"]["item"]["uri"]
+        call_site = {"start": {"line": 2, "character": 8}, "end": {"line": 2, "character": 18}}
+        return [{"to": function_item("xyz_callee", uri), "fromRanges": [call_site]}]
+    return None
+
+
+while True:
+    header = sys.stdin.buffer.readline()
+    if not header:
+        break
+    length = int(header.split(b":")[1])
+    sys.stdin.buffer.readline()
+    message = json.loads(sys.stdin.buffer.read(length))
+    if "id" not in message:
+        continue
+    reply = json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": answer(message)})
+    body = reply.encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+"#;
+
+    /// A prototype's call sites are lines of the .c file, so only the .c file
+    /// gets the outgoing calls.
+    #[tokio::test]
+    async fn test_outgoing_calls_skip_a_prototype_defined_in_another_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let server = temp.path().join("prototype-to-definition-server");
+        std::fs::write(&server, PROTOTYPE_TO_DEFINITION_SERVER).unwrap();
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let header = repo.join("xyz.h");
+        std::fs::write(&header, "int xyz_caller(void);\n").unwrap();
+        let source = repo.join("xyz.c");
+        std::fs::write(
+            &source,
+            "int xyz_caller(void)\n{\n\treturn xyz_callee();\n}\n",
+        )
+        .unwrap();
+
+        let config = LspConfig {
+            enabled: true,
+            enabled_languages: HashMap::from([("c".to_string(), true)]),
+            server_paths: HashMap::from([("c".to_string(), server)]),
+            timeout_ms: 30000,
+            ..Default::default()
+        };
+        let manager = LspManager::new(config, vec![repo]);
+        let functions = vec![("xyz_caller".to_string(), 1)];
+
+        let header_calls = manager
+            .call_hierarchy_outgoing_batch(SourceSet::CCLS, &header, &functions)
+            .await;
+        assert_eq!(header_calls, vec![Vec::new()]);
+        let source_calls = manager
+            .call_hierarchy_outgoing_batch(SourceSet::CCLS, &source, &functions)
+            .await;
+        assert_eq!(
+            source_calls,
+            vec![vec![(
+                "xyz_callee".to_string(),
+                source.to_string_lossy().to_string(),
+                3
+            )]]
+        );
     }
 }
