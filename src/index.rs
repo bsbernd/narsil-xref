@@ -47,6 +47,8 @@ pub struct RepoMetadata {
     /// does not regenerate the manifest, so sources changed since this commit
     /// are unlisted through no fault of their own and survive the filter.
     pub cdb_head_hash: Option<String>,
+    /// [`CodeIntelEngine::index_options_hash`] this index was built under.
+    pub options_hash: Option<String>,
     /// Indexer extraction-logic version (`crate::persist::INDEX_LOGIC_VERSION`)
     /// this index was built under; a mismatch forces a rebuild even when the
     /// fingerprint is unchanged.
@@ -194,6 +196,16 @@ impl Default for EngineOptions {
 enum ScopeRule {
     Prefix(String),
     Glob(glob::Pattern),
+}
+
+impl ScopeRule {
+    /// The entry as configured, after trimming.
+    fn text(&self) -> &str {
+        match self {
+            ScopeRule::Prefix(prefix) => prefix,
+            ScopeRule::Glob(pattern) => pattern.as_str(),
+        }
+    }
 }
 
 /// Per-repo compiled scope rules and gtags overrides. Built once per repo in
@@ -819,6 +831,7 @@ impl CodeIntelEngine {
                                 head_hash: persisted.head_hash.clone(),
                                 cdb_hash: persisted.cdb_hash.clone(),
                                 cdb_head_hash: persisted.cdb_head_hash.clone(),
+                                options_hash: persisted.options_hash.clone(),
                                 logic_version: persisted.logic_version,
                             };
 
@@ -1230,14 +1243,45 @@ impl CodeIntelEngine {
         (!hash.is_empty()).then_some(hash)
     }
 
+    /// sha256 over the options that choose which files and backends feed a
+    /// repo's symbols: `include`, the repo's `index_filter`, whether a GTAGS
+    /// database is used, and the LSP backends; part of the index freshness
+    /// fingerprint.
+    fn index_options_hash(&self, repo_name: &str, repo_path: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for entry in &self.options.include {
+            hasher.update(entry.as_bytes());
+            hasher.update([0]);
+        }
+        // Ends the include list, so an entry cannot move into index_filter
+        // and hash the same.
+        hasher.update([1]);
+        for rule in self.repo_index_filter_rules(repo_name) {
+            hasher.update(rule.text().as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update([1]);
+        hasher.update([u8::from(self.gtags_repo_enabled(repo_path))]);
+        let lsp_backends = match &self.lsp_manager {
+            Some(lsp) if self.lsp_repo_enabled(repo_path) => {
+                lsp.active_cxx_backends_for(Path::new(repo_name))
+            }
+            _ => Vec::new(),
+        };
+        hasher.update(format!("{:?}", lsp_backends).as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
     /// True when the in-memory repo metadata's recorded fingerprint still matches
-    /// the repo's current git HEAD and compile_commands.json. A false result
-    /// means the cached symbols are stale and must be rebuilt.
+    /// the repo's current git HEAD, compile_commands.json and indexing options.
+    /// A false result means the cached symbols are stale and must be rebuilt.
     fn fingerprint_matches(&self, repo_name: &str, repo_path: &Path) -> bool {
-        let (prior_head, prior_cdb, prior_logic) = match self.repos.get(repo_name) {
+        let (prior_head, prior_cdb, prior_options, prior_logic) = match self.repos.get(repo_name) {
             Some(meta) => (
                 meta.head_hash.clone(),
                 meta.cdb_hash.clone(),
+                meta.options_hash.clone(),
                 meta.logic_version,
             ),
             None => return false,
@@ -1256,7 +1300,10 @@ impl CodeIntelEngine {
         if head.is_none() && cdb.is_none() {
             return false;
         }
-        prior_head == head && prior_cdb == cdb
+        prior_head == head
+            && prior_cdb == cdb
+            && prior_options.as_deref()
+                == Some(self.index_options_hash(repo_name, repo_path).as_str())
     }
 
     /// Persisted per-file `(content_hash, symbols)` for a repo, keyed by the
@@ -1692,7 +1739,7 @@ impl CodeIntelEngine {
         let symbols_cached = was_cached && self.fingerprint_matches(&repo_name, path);
         let prior_symbols = if was_cached && !symbols_cached {
             info!(
-                "index fingerprint changed (HEAD or compile_commands.json) — rebuilding symbols for {}",
+                "index fingerprint changed (HEAD, compile_commands.json or indexing options) — rebuilding symbols for {}",
                 repo_name
             );
             self.load_prior_file_symbols(path)
@@ -2272,6 +2319,7 @@ impl CodeIntelEngine {
             head_hash: self.git_head_hash(path),
             cdb_hash: self.compile_commands_hash(path),
             cdb_head_hash: cdb_diff_base,
+            options_hash: Some(self.index_options_hash(&repo_name, path)),
             logic_version: crate::persist::INDEX_LOGIC_VERSION,
         };
 
@@ -5163,6 +5211,12 @@ impl CodeIntelEngine {
             // manifest since the last full index moved the base to HEAD, and
             // writing the old base next to the new hash would strand it.
             persisted.cdb_head_hash = self.compile_commands_diff_base(&repo_name, repo_path);
+            // Copied from memory: a GTAGS database built since the index does
+            // not make the indexed symbols carry gtags definitions.
+            persisted.options_hash = self
+                .repos
+                .get(&repo_name)
+                .and_then(|meta| meta.options_hash.clone());
 
             // Group augmentation edges by the caller's file so each rides its
             // file's record (and the incremental watch path's keying).
@@ -6704,6 +6758,7 @@ impl CodeIntelEngine {
                         + meta.head_hash.as_ref().map_or(0, String::capacity)
                         + meta.cdb_hash.as_ref().map_or(0, String::capacity)
                         + meta.cdb_head_hash.as_ref().map_or(0, String::capacity)
+                        + meta.options_hash.as_ref().map_or(0, String::capacity)
                 })
                 .sum::<usize>();
 
@@ -11590,6 +11645,47 @@ similarity index 90%
         persisted.logic_version = crate::persist::INDEX_LOGIC_VERSION - 1;
         store.save_full(&persisted).unwrap();
         assert!(engine.load_prior_file_symbols(&repo).is_none());
+    }
+
+    /// Regression: with --persist, an index built without index_filter was
+    /// served unchanged after the filter was set, git HEAD being the same.
+    #[tokio::test]
+    async fn persisted_index_is_rebuilt_when_index_filter_changes() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        write_file(&repo.join("kept/xyz_kept.rs"), "pub fn xyz_kept() {}\n");
+        write_file(&repo.join("other/xyz_other.rs"), "pub fn xyz_other() {}\n");
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "init"]);
+
+        let open_engine = |index_filter: Vec<String>| {
+            CodeIntelEngine::with_options(
+                temp.path().join("index"),
+                vec![repo.clone()],
+                EngineOptions {
+                    persist_enabled: true,
+                    index_filter,
+                    ..Default::default()
+                },
+            )
+        };
+        let unfiltered = open_engine(Vec::new()).await.unwrap();
+        unfiltered.complete_initialization().await.unwrap();
+        drop(unfiltered);
+
+        let filtered = open_engine(vec!["kept".to_string()]).await.unwrap();
+        filtered.complete_initialization().await.unwrap();
+        let repo_key = canonical_repo_key(&repo).unwrap();
+        let names: Vec<String> = filtered
+            .symbols
+            .get(&repo_key)
+            .unwrap()
+            .iter()
+            .map(|symbol| symbol.name.clone())
+            .collect();
+        assert!(names.contains(&"xyz_kept".to_string()), "{names:?}");
+        assert!(!names.contains(&"xyz_other".to_string()), "{names:?}");
     }
 
     /// The sweep exists to bound what stdio delegation adds to a long-running
