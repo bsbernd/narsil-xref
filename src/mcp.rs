@@ -127,7 +127,7 @@ impl McpServer {
             ConfigLoader::new().default_config.clone()
         });
         let tool_registry = ToolRegistry::new();
-        let engine = Arc::new(engine);
+        let engine = engine.into_shared();
         engine.metrics.set_known_tools(
             tool_registry
                 .tool_names()

@@ -6,7 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -546,6 +546,11 @@ pub struct CodeIntelEngine {
     /// guard can be held by `IndexUpdateLeases` across `.await` points and
     /// moved into the watcher's debounce task.
     update_gate: Arc<tokio::sync::Mutex<()>>,
+    /// The engine's own `Arc`, for a task `reindex` leaves running past its
+    /// return. Empty unless the engine was built through `into_shared`.
+    shared_self: std::sync::Weak<CodeIntelEngine>,
+    /// Repos with a deferred first pass queued by `reindex`. Canonical keys.
+    deferred_first_passes: parking_lot::Mutex<HashSet<String>>,
 }
 
 impl CodeIntelEngine {
@@ -746,6 +751,8 @@ impl CodeIntelEngine {
             index_filtered_repos: DashMap::new(),
             index_leases: DashMap::new(),
             update_gate: Arc::new(tokio::sync::Mutex::new(())),
+            shared_self: std::sync::Weak::new(),
+            deferred_first_passes: parking_lot::Mutex::new(HashSet::new()),
         };
 
         // Try to load persisted indexes first if persistence is enabled
@@ -2811,6 +2818,15 @@ impl CodeIntelEngine {
         }
     }
 
+    /// Wrap the engine in an `Arc` it can reach itself through, so `reindex`
+    /// can leave a first pass running after it returns EAGAIN.
+    pub fn into_shared(self) -> Arc<Self> {
+        Arc::new_cyclic(|shared_self| Self {
+            shared_self: shared_self.clone(),
+            ..self
+        })
+    }
+
     /// The lease for `repo_key`, created on first use.
     fn index_lease(&self, repo_key: &str) -> IndexLease {
         self.index_leases
@@ -3001,7 +3017,6 @@ impl CodeIntelEngine {
                         None => return Err(unknown),
                     },
                 };
-                let path = PathBuf::from(&repo_key);
                 // Held across the clears below: without it a query lands
                 // between "symbols removed" and "symbols rebuilt" and is
                 // answered from an empty index. Bounded: a reindex that
@@ -3012,50 +3027,19 @@ impl CodeIntelEngine {
                     .await
                 else {
                     let (indexed_repos, total_repos) = self.indexing_progress();
+                    let first_pass = !self.repos.contains_key(&repo_key);
+                    if first_pass {
+                        self.defer_first_pass(&repo_key);
+                    }
                     return Err(IndexBusy {
-                        first_pass: !self.repos.contains_key(&repo_key),
+                        first_pass,
                         repo: repo_key,
                         indexed_repos,
                         total_repos,
                     }
                     .into());
                 };
-                let was_indexed = self.repos.remove(&repo_key).is_some();
-                self.symbols.remove(&repo_key);
-                // Drop this repo's cached contents; index_repo only inserts, so a
-                // file the new branch does not have would keep answering
-                // find_references and every other file_cache reader. A nested
-                // registered repo lives under the same root and keeps its own.
-                let nested: Vec<PathBuf> = self
-                    .registered_repo_paths()
-                    .into_iter()
-                    .filter(|p| p != &path && p.starts_with(&path))
-                    .collect();
-                self.file_cache.retain(|cached, _| {
-                    !cached.starts_with(&path) || nested.iter().any(|n| cached.starts_with(n))
-                });
-                // Reset call graph so stale nodes from a branch switch don't linger.
-                // build_from_files only inserts/overwrites — it never removes — so
-                // functions deleted on the new branch would otherwise persist.
-                if self.options.call_graph_enabled {
-                    self.call_graphs.insert(repo_key.clone(), CallGraph::new());
-                }
-                // Invalidate all caches for this repo so stale analysis results
-                // (callers, callees, paths) are not served after the rebuild.
-                self.query_cache.invalidate_for_repo(&repo_key);
-                self.analysis_cache.invalidate_where(|k| k.repo == repo_key);
-                self.index_repo(&path).await?;
-                // A configured repo is counted by the startup sweep instead,
-                // which may not have reached it yet.
-                let adopted = self
-                    .repo_paths
-                    .read()
-                    .iter()
-                    .any(|repo| repo.path == path && repo.origin == RepoOrigin::Adopted);
-                if adopted && !was_indexed {
-                    self.indexed_repos_count.fetch_add(1, Ordering::Release);
-                }
-                self.rebase_memory_baseline();
+                self.rebuild_repo(&repo_key).await?;
                 if newly_registered {
                     Ok(format!("Registered and indexed repository: {}", repo_key))
                 } else {
@@ -3067,6 +3051,78 @@ impl CodeIntelEngine {
                 Ok("Re-indexed all repositories".to_string())
             }
         }
+    }
+
+    /// Index a repo whose `reindex` gave up on the update gate, once the gate
+    /// is free. Otherwise nothing indexes a repo `reindex` just registered,
+    /// and every query on it answers EAGAIN.
+    fn defer_first_pass(&self, repo_key: &str) {
+        let Some(engine) = self.shared_self.upgrade() else {
+            return;
+        };
+        if !self
+            .deferred_first_passes
+            .lock()
+            .insert(repo_key.to_string())
+        {
+            return;
+        }
+        let repo_key = repo_key.to_string();
+        tokio::spawn(async move {
+            let _leases = engine
+                .index_update_leases(std::slice::from_ref(&repo_key))
+                .await;
+            if !engine.repos.contains_key(&repo_key) {
+                if let Err(e) = engine.rebuild_repo(&repo_key).await {
+                    warn!("deferred first pass of {} failed: {}", repo_key, e);
+                }
+            }
+            engine.deferred_first_passes.lock().remove(&repo_key);
+        });
+    }
+
+    /// Rebuild the index of `repo_key` from scratch. The caller holds the
+    /// update leases of `repo_key`.
+    async fn rebuild_repo(&self, repo_key: &str) -> Result<()> {
+        let path = PathBuf::from(repo_key);
+        let was_indexed = self.repos.remove(repo_key).is_some();
+        self.symbols.remove(repo_key);
+        // Drop this repo's cached contents; index_repo only inserts, so a
+        // file the new branch does not have would keep answering
+        // find_references and every other file_cache reader. A nested
+        // registered repo lives under the same root and keeps its own.
+        let nested: Vec<PathBuf> = self
+            .registered_repo_paths()
+            .into_iter()
+            .filter(|p| p != &path && p.starts_with(&path))
+            .collect();
+        self.file_cache.retain(|cached, _| {
+            !cached.starts_with(&path) || nested.iter().any(|n| cached.starts_with(n))
+        });
+        // Reset call graph so stale nodes from a branch switch don't linger.
+        // build_from_files only inserts/overwrites — it never removes — so
+        // functions deleted on the new branch would otherwise persist.
+        if self.options.call_graph_enabled {
+            self.call_graphs
+                .insert(repo_key.to_string(), CallGraph::new());
+        }
+        // Invalidate all caches for this repo so stale analysis results
+        // (callers, callees, paths) are not served after the rebuild.
+        self.query_cache.invalidate_for_repo(repo_key);
+        self.analysis_cache.invalidate_where(|k| k.repo == repo_key);
+        self.index_repo(&path).await?;
+        // A configured repo is counted by the startup sweep instead,
+        // which may not have reached it yet.
+        let adopted = self
+            .repo_paths
+            .read()
+            .iter()
+            .any(|repo| repo.path == path && repo.origin == RepoOrigin::Adopted);
+        if adopted && !was_indexed {
+            self.indexed_repos_count.fetch_add(1, Ordering::Release);
+        }
+        self.rebase_memory_baseline();
+        Ok(())
     }
 
     /// Drop every trace of a repository: its symbols, search documents, call
@@ -10820,6 +10876,43 @@ similarity index 90%
         assert_eq!(engine.indexing_progress(), (1, 1));
         engine.forget_repo(&key).await.unwrap();
         assert_eq!(engine.indexing_progress(), (0, 0));
+    }
+
+    /// reindex on a new repo timed out on the update gate, and nothing ever
+    /// indexed the repo it had just registered.
+    #[tokio::test]
+    async fn busy_reindex_of_a_new_repo_indexes_it_once_the_gate_is_free() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("adopted");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        write_file(&repo.join("main.c"), "int main(void) { return 0; }\n");
+        let engine = CodeIntelEngine::new(temp.path().join("index"), vec![])
+            .await
+            .unwrap()
+            .into_shared();
+        let key = canonical_repo_key(&repo).unwrap();
+
+        let other_update = engine.begin_update_window().await;
+        let error = engine
+            .reindex(Some(&repo.to_string_lossy()))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<IndexBusy>()
+                .is_some_and(|busy| busy.first_pass),
+            "{error}"
+        );
+        drop(other_update);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !engine.repos.contains_key(&key) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{key} still unindexed 10s after the update gate was released"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// get_index_status printed "Complete" next to "20/21 repositories" while
