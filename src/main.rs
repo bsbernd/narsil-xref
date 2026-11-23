@@ -665,10 +665,10 @@ async fn main() -> Result<()> {
 
     // NOTE: Engine creation is now fast and returns immediately.
     // Indexing happens in background to allow quick MCP server startup.
-    let engine = Arc::new(
+    let engine =
         index::CodeIntelEngine::with_options(server_args.index_path, repos.clone(), options)
-            .await?,
-    );
+            .await?
+            .into_shared();
 
     // Publish this process's status so `narsil-xref stats` (and a human
     // diagnosing the stdio↔SSE path) can see its role, URL, and repos. The
