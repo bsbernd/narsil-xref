@@ -6259,6 +6259,7 @@ impl CodeIntelEngine {
         &self,
         repo: &str,
         commit: &str,
+        base: Option<&str>,
         path: Option<&str>,
         max_bytes: Option<usize>,
         context_lines: Option<usize>,
@@ -6277,11 +6278,14 @@ impl CodeIntelEngine {
             )
         })?;
 
-        let diff = git_repo.commit_diff(commit, path, context_lines)?;
+        let diff = git_repo.commit_diff(commit, base, path, context_lines)?;
         let files = split_diff_by_file(&diff);
 
         let mut output = String::new();
-        output.push_str(&format!("# Commit Diff: `{}`\n\n", commit));
+        match base {
+            Some(base) => output.push_str(&format!("# Diff: `{}` to `{}`\n\n", base, commit)),
+            None => output.push_str(&format!("# Commit Diff: `{}`\n\n", commit)),
+        }
         if let Some(p) = path {
             output.push_str(&format!("**File**: `{}`\n\n", p));
         }
@@ -6341,10 +6345,12 @@ impl CodeIntelEngine {
             }
             output.push_str(&format!(
                 "\n*Showing {} of {} files. One file at a time: \
-                 get_commit_diff(commit=\"{}\", path=\"{}\").*\n",
+                 get_commit_diff(commit=\"{}\"{}, path=\"{}\").*\n",
                 shown,
                 files.len(),
                 commit,
+                base.map(|base| format!(", base=\"{}\"", base))
+                    .unwrap_or_default(),
                 files[shown].path
             ));
         }
@@ -10963,7 +10969,7 @@ similarity index 90%
         let repo_arg = repo.to_str().unwrap();
 
         let diff = engine
-            .get_commit_diff(repo_arg, "HEAD", None, None, None)
+            .get_commit_diff(repo_arg, "HEAD", None, None, None, None)
             .await
             .unwrap();
         assert!(diff.contains("**Files changed**: 3"), "diff was: {}", diff);
@@ -10976,18 +10982,83 @@ similarity index 90%
 
         // The deleted file is gone from the working tree; its diff is not.
         let deleted = engine
-            .get_commit_diff(repo_arg, "HEAD", Some("test_ctests.py"), None, None)
+            .get_commit_diff(repo_arg, "HEAD", None, Some("test_ctests.py"), None, None)
             .await
             .unwrap();
         assert!(deleted.contains("-import pytest"), "diff was: {}", deleted);
 
         // A caller comparing two commits in one answer asks for less.
         let capped = engine
-            .get_commit_diff(repo_arg, "HEAD", None, Some(6 * 1024), None)
+            .get_commit_diff(repo_arg, "HEAD", None, None, Some(6 * 1024), None)
             .await
             .unwrap();
         assert!(capped.len() < diff.len(), "max_bytes did not shrink");
         assert!(capped.contains("## Files not shown"));
+    }
+
+    /// `base` turns get_commit_diff into the combined diff from `base` to
+    /// `commit`: a file changed by two commits shows once, with both edits.
+    #[tokio::test]
+    async fn get_commit_diff_with_base_shows_the_combined_diff() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        write_file(&repo.join("xyz_a.txt"), "zero\n");
+        write_file(&repo.join("xyz_b.txt"), "zero\n");
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "-q", "-m", "xyz base"]);
+        write_file(&repo.join("xyz_a.txt"), "one\n");
+        run_git(&repo, &["commit", "-qa", "-m", "xyz first"]);
+        write_file(&repo.join("xyz_a.txt"), "two\n");
+        write_file(&repo.join("xyz_b.txt"), "one\n");
+        run_git(&repo, &["commit", "-qa", "-m", "xyz second"]);
+
+        let engine = CodeIntelEngine::with_options(
+            temp.path().join("index"),
+            vec![repo.clone()],
+            EngineOptions {
+                git_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let repo_arg = repo.to_str().unwrap();
+
+        let combined = engine
+            .get_commit_diff(repo_arg, "HEAD", Some("HEAD~2"), None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            combined.contains("**Files changed**: 2"),
+            "diff: {combined}"
+        );
+        // One hunk from zero to two: the value "one" that the first commit
+        // wrote and the second commit replaced never appears as a removal.
+        assert!(combined.contains("-zero") && combined.contains("+two"));
+        assert!(!combined.contains("-one"), "diff: {combined}");
+
+        let one_file = engine
+            .get_commit_diff(
+                repo_arg,
+                "HEAD",
+                Some("HEAD~2"),
+                Some("xyz_b.txt"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            one_file.contains("**Files changed**: 1"),
+            "diff: {one_file}"
+        );
+
+        let bad = engine
+            .get_commit_diff(repo_arg, "HEAD", Some("-x"), None, None, None)
+            .await;
+        assert!(bad.is_err());
     }
 
     /// A file deleted by a later commit is absent from the working tree, and
