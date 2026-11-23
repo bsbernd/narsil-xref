@@ -105,7 +105,8 @@ pub struct McpServer {
     engine: Arc<CodeIntelEngine>,
     tool_registry: ToolRegistry,
     config: ToolConfig,
-    /// Tool groups from `--expose`. Empty exposes every registered tool.
+    /// Tool groups from `--expose`. Empty lists the config or default groups
+    /// in tools/list and refuses no tools/call.
     expose: Vec<ExposeGroup>,
 }
 

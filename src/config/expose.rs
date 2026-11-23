@@ -37,6 +37,9 @@ impl ExposeGroup {
         ExposeGroup::Analysis,
     ];
 
+    /// The groups exposed when neither `--expose` nor config selects any.
+    pub const DEFAULT: [ExposeGroup; 2] = [ExposeGroup::Code, ExposeGroup::Git];
+
     /// The CLI spelling of this group.
     pub fn name(&self) -> &'static str {
         match self {
@@ -76,12 +79,13 @@ impl ExposeGroup {
     }
 
     /// Union of the selected groups, with `Base` always folded in. An empty
-    /// selection yields an empty set, which the filter reads as "no group
-    /// filter — every registered tool".
+    /// selection yields the union of [`ExposeGroup::DEFAULT`].
     pub fn union(groups: &[ExposeGroup]) -> HashSet<&'static str> {
-        if groups.is_empty() {
-            return HashSet::new();
-        }
+        let groups = if groups.is_empty() {
+            &Self::DEFAULT[..]
+        } else {
+            groups
+        };
 
         let mut tools = Self::base_tools();
         for group in groups {
@@ -220,11 +224,12 @@ mod tests {
         assert!(!tools.contains("find_symbols"));
     }
 
-    /// Empty means "no group filter", not "expose nothing" — the filter falls
-    /// back to the preset.
     #[test]
-    fn test_expose_union_empty_is_empty() {
-        assert!(ExposeGroup::union(&[]).is_empty());
+    fn test_expose_union_empty_is_code_and_git() {
+        assert_eq!(
+            ExposeGroup::union(&[]),
+            ExposeGroup::union(&[ExposeGroup::Code, ExposeGroup::Git])
+        );
     }
 
     #[test]

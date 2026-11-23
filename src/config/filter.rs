@@ -12,8 +12,7 @@ use std::collections::HashSet;
 pub struct ToolFilter {
     config: ToolConfig,
     enabled_flags: HashSet<FeatureFlag>,
-    /// Tool whitelist from `--expose`, already unioned across groups. Empty
-    /// means no group filter was requested.
+    /// Tool whitelist from `--expose`, already unioned across groups.
     expose: HashSet<&'static str>,
 }
 
@@ -107,7 +106,7 @@ impl ToolFilter {
         }
 
         // 2. Check the --expose group whitelist.
-        if !self.expose.is_empty() && !self.expose.contains(tool_name) {
+        if !self.expose.contains(tool_name) {
             return false;
         }
 
