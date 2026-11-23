@@ -1525,6 +1525,57 @@ impl CodeIntelEngine {
             .is_ignore()
     }
 
+    /// Whether `--index-filter` keeps `path` out of the index of `repo_name`.
+    fn outside_index_filter(&self, repo_name: &str, repo_path: &Path, path: &Path) -> bool {
+        if !self.repo_index_filtered(repo_name) {
+            return false;
+        }
+        let rel = path
+            .strip_prefix(repo_path)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+        // A file pulled in for being referenced by in-scope code sits
+        // outside the rules yet is already indexed; its presence in the
+        // file cache is what says so.
+        !scope_matches(
+            self.repo_index_filter_rules(repo_name),
+            &rel,
+            &path.to_string_lossy(),
+        ) && !self.file_cache.contains_key(path)
+    }
+
+    /// Whether applying `change` can alter what a query reads, so the watcher
+    /// holds the repo's update lease while the change is applied.
+    ///
+    /// False for a path outside every repo, a path the indexer ignores, and a
+    /// file outside `--index-filter` that is not indexed. For those,
+    /// process_file_changes() updates at most the definition map, which only
+    /// an index pass reads.
+    pub fn change_visible_to_queries(&self, change: &crate::persist::FileChange) -> bool {
+        if change
+            .path
+            .file_name()
+            .is_some_and(|n| n == "compile_commands.json")
+        {
+            return true;
+        }
+        let Some(repo_path) = self
+            .registered_repo_paths()
+            .into_iter()
+            .find(|p| path_is_within_repo(&change.path, p))
+        else {
+            return false;
+        };
+        if self.is_ignored_for_index(&repo_path, &change.path) {
+            return false;
+        }
+        match canonical_repo_key(&repo_path) {
+            Ok(repo_name) => !self.outside_index_filter(&repo_name, &repo_path, &change.path),
+            Err(_) => false,
+        }
+    }
+
     /// Refresh the GTAGS database for `repo_path` when gtags is the active C/C++
     /// backend, mirroring index_repo's refresh gating. The watch path calls this
     /// wherever it brings clangd back in sync (compile_commands change, source edit)
@@ -5689,24 +5740,8 @@ impl CodeIntelEngine {
             // --index-filter: in a repo whose base index is restricted, never
             // (re)index a file outside the scope. Repos not restricted are
             // untouched, so this changes nothing for them.
-            if self.repo_index_filtered(&repo_name) {
-                let rel = change
-                    .path
-                    .strip_prefix(repo_path)
-                    .unwrap_or(&change.path)
-                    .to_string_lossy()
-                    .into_owned();
-                // A file pulled in for being referenced by in-scope code sits
-                // outside the rules yet is already indexed; its presence in the
-                // file cache is what says so.
-                if !scope_matches(
-                    self.repo_index_filter_rules(&repo_name),
-                    &rel,
-                    &change.path.to_string_lossy(),
-                ) && !self.file_cache.contains_key(&change.path)
-                {
-                    continue;
-                }
+            if self.outside_index_filter(&repo_name, repo_path, &change.path) {
+                continue;
             }
 
             // A C/C++ source changed (created/modified/deleted): flag the repo so its
@@ -11743,6 +11778,85 @@ similarity index 90%
         let callers = graph.get_callers("target");
         assert_eq!(callers.len(), 1);
         assert_eq!(callers[0].target, "lib.rs::caller");
+    }
+
+    /// The watch batch that carries `path`, skipping earlier batches.
+    async fn watch_batch_with(
+        batches: &mut tokio::sync::mpsc::Receiver<crate::persist::WatchBatch>,
+        path: &Path,
+    ) -> crate::persist::WatchBatch {
+        loop {
+            let batch = tokio::time::timeout(std::time::Duration::from_secs(5), batches.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no watch batch with {path:?}"))
+                .expect("watcher stopped");
+            if batch.changes.iter().any(|change| change.path == path) {
+                return batch;
+            }
+        }
+    }
+
+    /// A query is answered while the watcher applies an ignored file or a
+    /// file outside --index-filter, which only reaches the definition map.
+    #[tokio::test]
+    async fn a_watch_batch_takes_the_repo_lease_only_for_changes_a_query_can_see() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        write_file(&repo.join("src/caller.rs"), "pub fn caller_fn() {}\n");
+        write_file(&repo.join("lib/helper.rs"), "pub fn helper_fn() {}\n");
+        let engine = Arc::new(
+            CodeIntelEngine::with_options(
+                temp.path().join("index"),
+                vec![repo.clone()],
+                EngineOptions {
+                    watch_enabled: true,
+                    persist_enabled: true,
+                    index_filter: vec!["src".to_string()],
+                    ..EngineOptions::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        engine.complete_initialization().await.unwrap();
+        engine.catch_up_on_definition_maps().await;
+        let store = engine.index_store.as_ref().unwrap();
+        assert!(store.definition_stats(&repo).is_some(), "no definition map");
+        let repo_key = canonical_repo_key(&repo).unwrap();
+        let (_watcher, mut batches) = Arc::clone(&engine).create_async_file_watcher().unwrap();
+
+        let hidden = repo.join("src/.cache/caller.rs");
+        write_file(&hidden, "pub fn hidden_copy_fn() {}\n");
+        let batch = watch_batch_with(&mut batches, &hidden).await;
+        assert!(
+            engine.index_lease(&repo_key).try_read().is_ok(),
+            "a batch with a hidden file holds the repo lease"
+        );
+        drop(batch);
+
+        let out_of_scope = repo.join("lib/helper.rs");
+        write_file(&out_of_scope, "pub fn helper_added_later_fn() {}\n");
+        let batch = watch_batch_with(&mut batches, &out_of_scope).await;
+        assert!(
+            engine.index_lease(&repo_key).try_read().is_ok(),
+            "a batch with a file outside --index-filter holds the repo lease"
+        );
+        engine.process_file_changes(&batch.changes).await.unwrap();
+        drop(batch);
+        let hits = store
+            .definitions_of(&repo, &["helper_added_later_fn".to_string()])
+            .unwrap();
+        assert_eq!(hits.len(), 1, "the definition map missed the edit");
+
+        let in_scope = repo.join("src/caller.rs");
+        write_file(&in_scope, "pub fn caller_changed_fn() {}\n");
+        let batch = watch_batch_with(&mut batches, &in_scope).await;
+        assert!(
+            engine.index_lease(&repo_key).try_read().is_err(),
+            "a batch with an in-scope file leaves the repo open to queries"
+        );
+        drop(batch);
     }
 
     /// A repo named by a query is stamped, which is what keeps one in active

@@ -1207,7 +1207,8 @@ pub struct AsyncFileWatcher {
 impl AsyncFileWatcher {
     /// Create a new async file watcher and return a channel receiver for
     /// batches of changes, each already holding the update-window leases for
-    /// the repos it touches.
+    /// the repos it touches. Changes no query can see go into separate batches
+    /// that hold no lease.
     ///
     /// The write lease for a repo is taken as soon as its first file-change
     /// event enters the debounce buffer, not only once the debounce timer
@@ -1232,6 +1233,7 @@ impl AsyncFileWatcher {
         // Spawn a task to process notify events and send batched changes
         tokio::spawn(async move {
             let mut debounce_buffer: HashMap<PathBuf, FileChange> = HashMap::new();
+            let mut unleased_buffer: HashMap<PathBuf, FileChange> = HashMap::new();
             // Leases already taken for this batch, grown as changes land.
             let mut held: Option<crate::index::IndexUpdateLeases> = None;
             let debounce_duration = Duration::from_millis(300);
@@ -1251,9 +1253,14 @@ impl AsyncFileWatcher {
                                     _ => continue,
                                 };
 
-                                let changes = source_changes_for_path(&path, change_type.clone());
-                                for change in &changes {
-                                    debounce_buffer.insert(change.path.clone(), change.clone());
+                                let mut changes = Vec::new();
+                                for change in source_changes_for_path(&path, change_type.clone()) {
+                                    if engine.change_visible_to_queries(&change) {
+                                        debounce_buffer.insert(change.path.clone(), change.clone());
+                                        changes.push(change);
+                                    } else {
+                                        unleased_buffer.insert(change.path.clone(), change);
+                                    }
                                 }
                                 // Take the write lease for every repo this event
                                 // touches before the file's stale state can be
@@ -1281,8 +1288,14 @@ impl AsyncFileWatcher {
                             for repo_key in engine.repos_for_changes(&changes) {
                                 leases.add(&engine, &repo_key).await;
                             }
-                            if tx.send(WatchBatch { changes, _leases: leases }).await.is_err() {
+                            if tx.send(WatchBatch { changes, _leases: Some(leases) }).await.is_err() {
                                 // Receiver dropped, exit task
+                                break;
+                            }
+                        }
+                        if !unleased_buffer.is_empty() {
+                            let changes: Vec<FileChange> = unleased_buffer.drain().map(|(_, v)| v).collect();
+                            if tx.send(WatchBatch { changes, _leases: None }).await.is_err() {
                                 break;
                             }
                         }
@@ -1322,12 +1335,12 @@ impl AsyncFileWatcher {
 }
 
 /// A debounced batch of file changes, plus the update-window leases already
-/// held for every repo it touches. Dropping it (once the batch has been
-/// applied) reopens those repos to queries.
+/// held for every repo it touches, or None when no query can see the changes.
+/// Dropping it (once the batch has been applied) reopens those repos to queries.
 #[cfg(feature = "native")]
 pub struct WatchBatch {
     pub changes: Vec<FileChange>,
-    _leases: crate::index::IndexUpdateLeases,
+    _leases: Option<crate::index::IndexUpdateLeases>,
 }
 
 /// A detected file change
