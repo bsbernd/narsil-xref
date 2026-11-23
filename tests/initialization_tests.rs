@@ -233,6 +233,7 @@ async fn test_get_branch_info_works_before_indexing_completes() {
         .get_branch_info(
             repo_path.to_str().unwrap(),
             narsil_xref::response_budget::ListWindow::new(0, 0),
+            false,
         )
         .await;
 

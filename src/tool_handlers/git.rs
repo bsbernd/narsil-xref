@@ -180,7 +180,8 @@ impl ToolHandler for GetBranchInfoHandler {
     async fn execute(&self, engine: &CodeIntelEngine, args: Value) -> Result<String> {
         let repo = args.get_str("repo").unwrap_or("");
         let window = super::list_window(&args, DEFAULT_BRANCH_INFO_LIMIT);
-        engine.get_branch_info(repo, window).await
+        let branches = args.get_bool_or("branches", false);
+        engine.get_branch_info(repo, window, branches).await
     }
 }
 
