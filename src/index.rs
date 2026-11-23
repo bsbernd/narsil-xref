@@ -10357,6 +10357,8 @@ fn fold_symbol(existing: &mut Symbol, incoming: Symbol, source: SourceSet) {
     // tree-sitter parsed the file as it is now; an LSP server may answer from
     // its index of an older version, with an end line in unrelated code.
     let keep_parsed_end = existing.confirmed_by.contains(SourceSet::TREE_SITTER);
+    // clangd reports a C or C++ typedef as a Class.
+    let keep_parsed_kind = keep_parsed_end && existing.kind == SymbolKind::TypeAlias;
     existing.confirmed_by.insert(source);
 
     if source.rank() > old_canonical.rank() {
@@ -10372,7 +10374,7 @@ fn fold_symbol(existing: &mut Symbol, incoming: Symbol, source: SourceSet) {
         }
 
         // Metadata follows the highest-priority source that supplies it.
-        if incoming.kind != SymbolKind::Unknown {
+        if incoming.kind != SymbolKind::Unknown && !keep_parsed_kind {
             existing.kind = incoming.kind;
         }
         // Except a C signature: clang answers `int` for a parameter whose type
@@ -11904,6 +11906,21 @@ similarity index 90%
         let found = CodeIntelEngine::enclosing_function_at(&symbols, "include/api.h", 5310)
             .expect("a symbol covers the line");
         assert_eq!(found.name, "session_start");
+    }
+
+    /// clangd reports a C typedef as a Class, which outranked the TypeAlias
+    /// tree-sitter parsed.
+    #[test]
+    fn merge_keeps_the_parsed_typedef_kind() {
+        let mut parsed = sym("xyz_t", 10, SourceSet::TREE_SITTER);
+        parsed.kind = SymbolKind::TypeAlias;
+        let mut clangd = sym("xyz_t", 10, SourceSet::CLANGD);
+        clangd.kind = SymbolKind::Class;
+        let mut existing = vec![parsed];
+
+        merge_symbols(&mut existing, vec![clangd], SourceSet::CLANGD);
+
+        assert_eq!(existing[0].kind, SymbolKind::TypeAlias);
     }
 
     #[test]
