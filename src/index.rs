@@ -6446,7 +6446,12 @@ impl CodeIntelEngine {
     }
 
     /// Get recent changes across the repository
-    pub async fn get_recent_changes(&self, repo: &str, days: u32) -> Result<String> {
+    pub async fn get_recent_changes(
+        &self,
+        repo: &str,
+        days: u32,
+        window: response_budget::ListWindow,
+    ) -> Result<String> {
         let repo_key = self.resolve_repo(repo)?;
         let git_repo = self.git_repos.get(&repo_key).ok_or_else(|| {
             anyhow!(
@@ -6459,9 +6464,17 @@ impl CodeIntelEngine {
 
         let mut output = String::new();
         output.push_str(&format!("# Recent Changes (last {} days)\n\n", days));
-        output.push_str(&format!("Found {} commits\n\n", changes.len()));
+        // GitRepo::recent_changes stops reading at MAX_LOG_COMMITS, so a count
+        // equal to it may be a lower bound.
+        let at_least = if changes.len() >= crate::git::MAX_LOG_COMMITS {
+            " or more"
+        } else {
+            ""
+        };
+        output.push_str(&format!("Found {}{} commits\n\n", changes.len(), at_least));
 
-        for commit in changes.iter().take(20) {
+        let (page, capped) = response_budget::cap(&changes, window, "get_recent_changes");
+        for commit in page {
             output.push_str(&format!(
                 "- `{}` {} - {} (+{} -{})\n",
                 commit.short_hash,
@@ -6470,6 +6483,10 @@ impl CodeIntelEngine {
                 commit.insertions,
                 commit.deletions
             ));
+        }
+        if capped.truncated() {
+            output.push('\n');
+            output.push_str(&capped.footer());
         }
 
         Ok(output)
@@ -10746,6 +10763,53 @@ mod tests {
             .unwrap();
         assert_eq!(output.matches(" step ").count(), 25);
         assert_eq!(output.matches("- `untracked_").count(), 25);
+    }
+
+    /// get_recent_changes counted every commit but listed 20 without saying so.
+    #[tokio::test]
+    async fn get_recent_changes_pages_with_limit_and_offset() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        for step in 0..25 {
+            write_file(&repo.join("xyz.txt"), &step.to_string());
+            run_git(&repo, &["add", "xyz.txt"]);
+            run_git(&repo, &["commit", "-q", "-m", &format!("xyz step {step}")]);
+        }
+        let engine = CodeIntelEngine::with_options(
+            temp.path().join("index"),
+            vec![repo.clone()],
+            EngineOptions {
+                git_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let repo_arg = repo.to_str().unwrap();
+
+        let first = engine
+            .get_recent_changes(repo_arg, 7, response_budget::ListWindow::new(0, 20))
+            .await
+            .unwrap();
+        assert!(first.contains("Found 25 commits"), "output: {first}");
+        assert_eq!(first.matches("xyz step").count(), 20, "output: {first}");
+        assert!(first.contains("Showing 20 of 25"), "output: {first}");
+        assert!(first.contains("offset=20"), "output: {first}");
+
+        let rest = engine
+            .get_recent_changes(repo_arg, 7, response_budget::ListWindow::new(20, 20))
+            .await
+            .unwrap();
+        assert_eq!(rest.matches("xyz step").count(), 5, "output: {rest}");
+        assert!(!rest.contains("Showing"), "output: {rest}");
+
+        let all = engine
+            .get_recent_changes(repo_arg, 7, response_budget::ListWindow::new(0, 0))
+            .await
+            .unwrap();
+        assert_eq!(all.matches("xyz step").count(), 25, "output: {all}");
     }
 
     /// gtags answers with every use of a name. These are the ones that made
