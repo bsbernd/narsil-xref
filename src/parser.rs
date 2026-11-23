@@ -166,7 +166,15 @@ impl LanguageParser {
                       ]) @function.def
                     (struct_specifier name: (type_identifier) @struct.name body: (field_declaration_list)) @struct.def
                     (enum_specifier name: (type_identifier) @enum.name body: (enumerator_list)) @enum.def
-                    (type_definition declarator: (type_identifier) @type.name) @type.def
+                    (type_definition
+                      declarator: [
+                        (type_identifier) @type.name
+                        (pointer_declarator declarator: (type_identifier) @type.name)
+                        (pointer_declarator declarator: (pointer_declarator declarator: (type_identifier) @type.name))
+                        (array_declarator declarator: (type_identifier) @type.name)
+                        (function_declarator declarator: (type_identifier) @type.name)
+                        (function_declarator declarator: (parenthesized_declarator (pointer_declarator declarator: (type_identifier) @type.name)))
+                      ]) @type.def
                     (preproc_def name: (identifier) @macro.name) @macro.def
                     (preproc_function_def name: (identifier) @macro.name) @macro.def
                     (translation_unit
@@ -866,6 +874,40 @@ static int helper(void) { return MAX_USERS; }
             .symbols
             .iter()
             .any(|s| s.name == "helper" && s.kind == SymbolKind::Function));
+    }
+
+    /// The typedef query matched only a bare name as the declarator, which
+    /// left out pointer, array and function typedefs.
+    #[test]
+    fn test_parse_c_typedef_declarators() {
+        let parser = LanguageParser::new().unwrap();
+        let content = r#"
+typedef int xyz_int_t;
+typedef struct xyz *xyz_ptr_t;
+typedef char **xyz_ptr_ptr_t;
+typedef struct xyz xyz_array_t[1];
+typedef int xyz_fn_t(int);
+typedef int (*xyz_callback_t)(struct xyz *arg);
+"#;
+        let parsed = parser.parse_file(Path::new("widget.c"), content).unwrap();
+
+        let typedefs: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::TypeAlias)
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(
+            typedefs,
+            [
+                "xyz_int_t",
+                "xyz_ptr_t",
+                "xyz_ptr_ptr_t",
+                "xyz_array_t",
+                "xyz_fn_t",
+                "xyz_callback_t"
+            ]
+        );
     }
 
     /// A file-scope variable declaration parses as `declaration`, a node the
