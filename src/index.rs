@@ -6319,8 +6319,9 @@ impl CodeIntelEngine {
             )
         })?;
 
-        let history = git_repo.symbol_history(&paths, symbol, max_commits)?;
+        let (history, method) = git_repo.symbol_history(&paths, symbol, max_commits)?;
         let mut output = git_repo.history_markdown(&history);
+        output.push_str(&format!("\n**Method**: {}\n", method));
         if path.is_empty() {
             // The caller named no file, so say which ones the answer covers —
             // an empty history is otherwise indistinguishable from a miss.
