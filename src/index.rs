@@ -1337,11 +1337,7 @@ impl CodeIntelEngine {
     /// matches a file the compile_commands.json coverage filter dropped from
     /// this repo's index, so the miss reads as "not indexed", not "no
     /// symbols" or "parser failure".
-    fn compile_commands_filter_note(
-        &self,
-        repo: &str,
-        file_glob: Option<&glob::Pattern>,
-    ) -> String {
+    fn compile_commands_filter_note(&self, repo: &str, file_glob: Option<&FilePattern>) -> String {
         let Some(glob) = file_glob else {
             return String::new();
         };
@@ -9307,22 +9303,85 @@ fn resolve_compile_command_file(
     None
 }
 
+/// A compiled `file_pattern`: one `glob::Pattern` per brace alternative,
+/// matching when any alternative matches.
+struct FilePattern {
+    patterns: Vec<glob::Pattern>,
+}
+
+impl FilePattern {
+    fn matches(&self, path: &str) -> bool {
+        self.patterns.iter().any(|p| p.matches(path))
+    }
+}
+
+/// Shell-style brace alternation: `a.{rs,toml}` gives `[a.rs, a.toml]`,
+/// nested groups included. The glob crate reads `{` as a literal character.
+fn expand_braces(pattern: &str) -> std::result::Result<Vec<String>, String> {
+    let Some(open) = pattern.find('{') else {
+        if pattern.contains('}') {
+            return Err("unbalanced '}' in brace alternation".to_string());
+        }
+        return Ok(vec![pattern.to_string()]);
+    };
+    let bytes = pattern.as_bytes();
+    let mut depth = 0usize;
+    let mut close = None;
+    let mut splits = Vec::new();
+    for (byte_idx, &byte) in bytes.iter().enumerate().skip(open) {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(byte_idx);
+                    break;
+                }
+            }
+            b',' if depth == 1 => splits.push(byte_idx),
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        return Err("unbalanced '{' in brace alternation".to_string());
+    };
+    let prefix = &pattern[..open];
+    let suffix = &pattern[close + 1..];
+    let mut alternatives = Vec::new();
+    let mut start = open + 1;
+    for split in splits.into_iter().chain(std::iter::once(close)) {
+        alternatives.push(&pattern[start..split]);
+        start = split + 1;
+    }
+    let mut out = Vec::new();
+    for alt in alternatives {
+        out.extend(expand_braces(&format!("{}{}{}", prefix, alt, suffix))?);
+    }
+    Ok(out)
+}
+
 /// The `file_pattern` glob of a find_symbols or search_code call. A bare file
 /// name matches at any depth.
-fn compile_file_pattern(pattern: &str) -> Result<glob::Pattern> {
-    let has_wildcard = pattern.contains(['*', '?', '[']);
+fn compile_file_pattern(pattern: &str) -> Result<FilePattern> {
+    let has_wildcard = pattern.contains(['*', '?', '[', '{']);
     let normalized = if !pattern.contains('/') && !has_wildcard {
         format!("**/{}", pattern)
     } else {
         pattern.to_string()
     };
-    glob::Pattern::new(&normalized).map_err(|e| {
+    let invalid = |e: &dyn std::fmt::Display| {
         anyhow!(
-            "Invalid file_pattern glob '{}': {} (examples: '**/README.md', 'src/**/*.rs')",
+            "Invalid file_pattern glob '{}': {} (examples: '**/README.md', 'src/**/*.{{rs,toml}}')",
             pattern,
             e
         )
-    })
+    };
+    let expanded = expand_braces(&normalized).map_err(|e| invalid(&e))?;
+    let mut patterns = Vec::new();
+    for alt in &expanded {
+        patterns.push(glob::Pattern::new(alt).map_err(|e| invalid(&e))?);
+    }
+    Ok(FilePattern { patterns })
 }
 
 fn compile_include_patterns(patterns: &[String]) -> Vec<glob::Pattern> {
@@ -12198,6 +12257,54 @@ similarity index 90%
             .await
             .expect_err("search_code answered for every file");
         assert!(err.to_string().contains("glob"), "got: {err}");
+    }
+
+    #[test]
+    fn expand_braces_plain_pattern_is_identity() {
+        assert_eq!(expand_braces("src/**/*.rs").unwrap(), vec!["src/**/*.rs"]);
+    }
+
+    #[test]
+    fn expand_braces_single_group() {
+        assert_eq!(
+            expand_braces("**/*.{json,md,yml}").unwrap(),
+            vec!["**/*.json", "**/*.md", "**/*.yml"]
+        );
+    }
+
+    #[test]
+    fn expand_braces_nested_and_multiple_groups() {
+        assert_eq!(
+            expand_braces("{src,tests}/**/*.{rs,{yml,yaml}}").unwrap(),
+            vec![
+                "src/**/*.rs",
+                "src/**/*.yml",
+                "src/**/*.yaml",
+                "tests/**/*.rs",
+                "tests/**/*.yml",
+                "tests/**/*.yaml",
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_braces_rejects_unbalanced() {
+        assert!(expand_braces("**/*.{json,md").is_err());
+        assert!(expand_braces("**/*.json}").is_err());
+    }
+
+    #[test]
+    fn compile_file_pattern_brace_glob_matches_each_alternative() {
+        let fp = compile_file_pattern("**/*.{json,md,yml}").unwrap();
+        assert!(fp.matches("docs/api/operation.json"));
+        assert!(fp.matches("README.md"));
+        assert!(fp.matches("deploy/values.yml"));
+        assert!(!fp.matches("src/main.go"));
+    }
+
+    #[test]
+    fn compile_file_pattern_rejects_unbalanced_brace() {
+        assert!(compile_file_pattern("**/*.{json").is_err());
     }
 
     #[test]
