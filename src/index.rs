@@ -4055,22 +4055,6 @@ impl CodeIntelEngine {
             output.push('\n');
         }
 
-        // A git submodule is indexed as its own repo, not merged into this one
-        // (a nested checkout crosses the git boundary), so a submodule-defined
-        // symbol can surface only its header declaration here while the .c
-        // definition is absent. Point the caller at the submodule to index.
-        let submodules = submodule_paths(&repo_path);
-        if !submodules.is_empty() {
-            output.push_str(&format!(
-                "\n> Note: this repo has git submodule(s): {}. Their sources are indexed \
-                 separately — if a definition looks missing, index the submodule with \
-                 `reindex(repo=\"{}/{}\")`.\n",
-                submodules.join(", "),
-                repo,
-                submodules[0]
-            ));
-        }
-
         // Cache the result with file dependencies for smart invalidation.
         if self.options.cache_enabled {
             self.query_cache
@@ -13027,6 +13011,31 @@ similarity index 90%
                 .any(|edge| edge.target.ends_with("::xyz_caller")),
             "{callers:?}"
         );
+    }
+
+    /// Regression: find_symbols told every repo with a .gitmodules that its
+    /// submodules were indexed separately, which index_repo() does not do.
+    #[tokio::test]
+    async fn find_symbols_prints_no_submodule_note() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        write_file(
+            &repo.join(".gitmodules"),
+            "[submodule \"xyz_sub\"]\n\tpath = xyz_sub\n\turl = ../xyz_sub\n",
+        );
+        write_file(&repo.join("xyz_sub/xyz.c"), "void xyz_fn(void) {}\n");
+        let engine = CodeIntelEngine::new(tmp.path().join("index"), vec![repo.clone()])
+            .await
+            .unwrap();
+        engine.complete_initialization().await.unwrap();
+        let repo_key = canonical_repo_key(&repo).unwrap();
+
+        let output = engine
+            .find_symbols(&repo_key, None, Some("xyz_fn"), None, None, 100)
+            .await
+            .unwrap();
+        assert!(output.contains("xyz_sub/xyz.c"), "{output}");
+        assert!(!output.contains("submodule"), "{output}");
     }
 
     #[test]
