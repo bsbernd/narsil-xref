@@ -193,6 +193,66 @@ pub fn worktree_main_repo_cached(path: &Path) -> Option<PathBuf> {
     answer
 }
 
+/// `(worktree root, branch)` of each entry of `git worktree list --porcelain`.
+/// A detached or bare entry has no branch.
+fn parse_worktree_porcelain(output: &str) -> Vec<(PathBuf, Option<String>)> {
+    let mut worktrees: Vec<(PathBuf, Option<String>)> = Vec::new();
+    for line in output.lines() {
+        if let Some(root) = line.strip_prefix("worktree ") {
+            worktrees.push((PathBuf::from(root), None));
+        } else if let Some(branch) = line.strip_prefix("branch ") {
+            if let Some(last) = worktrees.last_mut() {
+                let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+                last.1 = Some(short.to_string());
+            }
+        }
+    }
+    worktrees
+}
+
+/// Where `repo` is in the worktree that has `branch` checked out: that
+/// worktree's root plus the subdirectory `repo` has in its own worktree.
+/// `None` when no worktree of `repo` has `branch` checked out.
+pub fn worktree_for_branch(repo: &Path, branch: &str) -> Result<Option<PathBuf>> {
+    let output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(repo)
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git worktree list failed in {:?}: {}",
+            repo,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let worktrees = parse_worktree_porcelain(&String::from_utf8_lossy(&output.stdout));
+    let repo = repo.canonicalize()?;
+
+    // The deepest worktree holding `repo`: a worktree can sit inside another.
+    let subdir = worktrees
+        .iter()
+        .filter_map(|(root, _)| {
+            let root = root.canonicalize().ok()?;
+            repo.strip_prefix(&root).ok().map(Path::to_path_buf)
+        })
+        .min_by_key(|subdir| subdir.components().count());
+    let Some(subdir) = subdir else {
+        return Ok(None);
+    };
+    let Some((root, _)) = worktrees
+        .into_iter()
+        .find(|(_, checked_out)| checked_out.as_deref() == Some(branch))
+    else {
+        return Ok(None);
+    };
+    let root = root.canonicalize().unwrap_or(root);
+    // Joining an empty subdir would append a trailing '/' to the repo key.
+    if subdir.as_os_str().is_empty() {
+        return Ok(Some(root));
+    }
+    Ok(Some(root.join(subdir)))
+}
+
 /// Validate a repository path
 pub fn validate_repo_path(path: &Path) -> Result<()> {
     if !path.exists() {
@@ -281,5 +341,56 @@ mod tests {
 
         let resolved = worktree_main_repo(&worktree_path).unwrap();
         assert_eq!(resolved, main.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn parse_worktree_porcelain_reads_root_and_branch() {
+        let output = "worktree /src/widget\nHEAD 0123\nbranch refs/heads/main\n\n\
+                      worktree /src/widget-wt\nHEAD 4567\ndetached\n\n\
+                      worktree /src/widget-fix\nHEAD 89ab\nbranch refs/heads/fix/gadget\n";
+        assert_eq!(
+            parse_worktree_porcelain(output),
+            vec![
+                (PathBuf::from("/src/widget"), Some("main".to_string())),
+                (PathBuf::from("/src/widget-wt"), None),
+                (
+                    PathBuf::from("/src/widget-fix"),
+                    Some("fix/gadget".to_string())
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn worktree_for_branch_keeps_the_subdirectory_of_a_monorepo_package() {
+        let main = tempdir().unwrap();
+        run_git(main.path(), &["init", "-q"]);
+        std::fs::create_dir_all(main.path().join("pkg/widget")).unwrap();
+        std::fs::write(main.path().join("pkg/widget/lib.rs"), "").unwrap();
+        run_git(main.path(), &["add", "."]);
+        run_git(main.path(), &["commit", "-q", "-m", "init"]);
+        let worktree_parent = tempdir().unwrap();
+        let worktree_path = worktree_parent.path().join("wt");
+        run_git(
+            main.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree_path.to_str().unwrap(),
+                "-b",
+                "wt-branch",
+            ],
+        );
+
+        let package = main.path().join("pkg/widget");
+        assert_eq!(
+            worktree_for_branch(&package, "wt-branch").unwrap(),
+            Some(worktree_path.canonicalize().unwrap().join("pkg/widget"))
+        );
+        assert_eq!(
+            worktree_for_branch(&package, "no-such-branch").unwrap(),
+            None
+        );
     }
 }

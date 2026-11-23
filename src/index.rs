@@ -3213,6 +3213,9 @@ impl CodeIntelEngine {
     /// directory name, with or without the trailing `.git`; when several repos
     /// share that name the caller is asked for a path instead.
     ///
+    /// `<repo>@<branch>` names `<repo>` in its linked git worktree that has
+    /// `<branch>` checked out.
+    ///
     /// The returned string is the canonical absolute path as stored in the
     /// engine's repository maps — use it directly as the lookup key.
     pub(crate) fn resolve_repo(&self, input: &str) -> Result<String> {
@@ -3232,6 +3235,14 @@ impl CodeIntelEngine {
                 return Ok(only.to_string_lossy().into_owned());
             }
             return Err(self.repo_not_found_error(input));
+        }
+
+        if let Some((repo, branch)) = input.rsplit_once('@') {
+            if !Path::new(input).exists() {
+                if let Ok(main_key) = self.repo_key_for(repo) {
+                    return self.worktree_repo_key(&main_key, input, branch);
+                }
+            }
         }
 
         // A bare short name is not a path, so match it against the indexed
@@ -3280,6 +3291,30 @@ impl CodeIntelEngine {
         }
 
         Err(self.repo_not_found_error(input))
+    }
+
+    /// The key of the indexed repository `alias` (`<repo>@<branch>`) names:
+    /// `main_key` as it is in the linked worktree with `branch` checked out.
+    fn worktree_repo_key(&self, main_key: &str, alias: &str, branch: &str) -> Result<String> {
+        let worktree =
+            crate::repo::worktree_for_branch(Path::new(main_key), branch)?.ok_or_else(|| {
+                anyhow!(
+                    "'{}': no git worktree of {} has branch '{}' checked out.",
+                    alias,
+                    main_key,
+                    branch
+                )
+            })?;
+        if self.indexed_repo_paths().contains(&worktree) {
+            return Ok(worktree.to_string_lossy().into_owned());
+        }
+        Err(anyhow!(
+            "'{}' is the git worktree {}, which is not indexed. \
+             Index it with reindex(repo=\"{}\").",
+            alias,
+            worktree.display(),
+            worktree.display()
+        ))
     }
 
     /// Canonical paths of every repository the engine answers for: the indexed
@@ -12334,6 +12369,52 @@ similarity index 90%
             .await
             .expect_err("search_code answered for every file");
         assert!(err.to_string().contains("glob"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_maps_repo_at_branch_to_the_worktree() {
+        let dir = TempDir::new().unwrap();
+        let main = dir.path().join("widget");
+        std::fs::create_dir_all(&main).unwrap();
+        run_git(&main, &["init", "-q"]);
+        write_file(&main.join("lib.rs"), "pub fn widget_fn() {}\n");
+        run_git(&main, &["add", "."]);
+        run_git(&main, &["commit", "-qm", "init"]);
+        let worktree = dir.path().join("widget-wt");
+        run_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree.to_str().unwrap(),
+                "-b",
+                "wt-branch",
+            ],
+        );
+
+        let engine = CodeIntelEngine::with_options(
+            dir.path().join("index"),
+            vec![main.clone()],
+            EngineOptions::default(),
+        )
+        .await
+        .unwrap();
+        let main_key = canonical_repo_key(&main).unwrap();
+        let alias = format!("{main_key}@wt-branch");
+        let err = engine.resolve_repo(&alias).unwrap_err().to_string();
+        assert!(err.contains("reindex"), "got: {err}");
+
+        let worktree_key = engine
+            .register_unknown_repo(&worktree.to_string_lossy())
+            .unwrap();
+        assert_eq!(engine.resolve_repo(&alias).unwrap(), worktree_key);
+        assert_eq!(
+            engine.resolve_repo("widget@wt-branch").unwrap(),
+            worktree_key
+        );
+        let err = engine.resolve_repo("widget@no-such-branch").unwrap_err();
+        assert!(err.to_string().contains("no git worktree"), "got: {err}");
     }
 
     #[tokio::test]
